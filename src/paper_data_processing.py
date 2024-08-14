@@ -54,13 +54,9 @@ class DataProcessing:
         self.path_prevah = Path(paths["path_prevah"])
         self.path_data = Path(paths["path_data"])
         self.path_data_streamflow = Path(paths["path_data_streamflow"])
-        self.path_data_polygons = Path(paths["path_data_polygons"])
 
         self.path_data_hydro = self.path_data / "hydropower"
-        self.path_swiss_maps = (
-            self.path_data / "maps" / "swissboundaries3d_2023-01_2056_5728/"
-        )
-        self.path_polygon_connectivity = self.path_data / "st2km2_PolygonConnectivity"
+        self.path_data_polygons = self.path_data / "polygons"
 
         self.gdf_polygons = gpd.read_file(
             self.path_data_polygons / "EZG_Gewaesser.gpkg"
@@ -139,7 +135,7 @@ class DataProcessing:
         netcdf files. Each file contains one year of data.
         """
         path_hydro_tar = self.path_prevah / "compressed"
-        netcdf_output_dir = self.path_prevah / "netcdf_corrected"
+        netcdf_output_dir = self.path_prevah / "netcdf"
         if netcdf_output_dir.exists():
             shutil.rmtree(netcdf_output_dir)
         netcdf_output_dir.mkdir(exist_ok=True)
@@ -168,7 +164,7 @@ class DataProcessing:
         # Load sample runoff data
         ds_sample = transform_coords_old_to_new_swiss(
             xr.open_dataset(
-                self.path_prevah / "netcdf_corrected" / "Mob500_RGS_2002.nc"
+                self.path_prevah / "netcdf" / "Mob500_RGS_2002.nc"
             )
         )
 
@@ -203,13 +199,11 @@ class DataProcessing:
             pd.concat(list_gdfs, ignore_index=True).drop(columns="geometry")
         ).sort_values(by="EZGNR")
 
-        output_path = self.path_data / "runoff"
-        output_path.mkdir(exist_ok=True, parents=True)
         df_concat[["index_left", "EZGNR", "TEILEZGNR", "y", "x"]].to_csv(
-            self.path_data / "runoff" / output_filename, index=False
+            self.path_data_polygons / output_filename, index=False
         )
         self.df_prevah_pts_in_polygons = pd.read_csv(
-            self.path_data / "runoff" / output_filename
+            self.path_data_polygons / output_filename
         )
 
     def compute_accumulated_streamflow_per_polygon(
@@ -231,7 +225,7 @@ class DataProcessing:
         relevant_polygons = self.gdf_polygons.EZGNR.to_numpy()
         if not self.df_prevah_pts_in_polygons:
             self.df_prevah_pts_in_polygons = pd.read_csv(
-                self.path_data / "runoff" / df_prevah_pts_in_polygons_filename
+                self.path_data_polygons / df_prevah_pts_in_polygons_filename
             )
 
         # Converting streamflow to accumulated streamflow per polygon
@@ -239,7 +233,7 @@ class DataProcessing:
         list_ds_accum_streamflow = []
 
         time_start = time.time()
-        for path_rgs in list((self.path_prevah / "netcdf_corrected").glob("*")):
+        for path_rgs in list((self.path_prevah / "netcdf").glob("*")):
             year = path_rgs.stem.split("Mob500_RGS_")[1]
             ds_rgs = transform_coords_old_to_new_swiss(xr.open_dataset(path_rgs)).apply(
                 lambda v: convert_mm_d_to_cubic_m_s(v, 500 * 500)
@@ -305,7 +299,7 @@ class DataProcessing:
             upstream polygons, identified by their EZGNR
         """
         df_polygon_connectivity = pd.read_csv(
-            self.path_polygon_connectivity / "st2km2_ConnectivityEZGNR_polyg.csv"
+            self.path_data_polygons / "st2km2_ConnectivityEZGNR_polyg.csv"
         )
         df_upstream_polygons = (
             df_polygon_connectivity.groupby("tEZGNR")["fEZGNR"]
