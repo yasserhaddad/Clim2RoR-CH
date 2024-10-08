@@ -1195,8 +1195,8 @@ class NationalAnalysisHydropower:
 
         return pd.DataFrame(bias, index=["Bias"])
 
+    @staticmethod
     def compute_trend_statsmodel(
-        self,
         X: np.ndarray,
         y: np.ndarray,
         alpha: float = 0.05,
@@ -1281,7 +1281,14 @@ class NationalAnalysisHydropower:
             "a", fontweight="bold", loc="left", fontsize=FONTSIZE_TITLE, y=1.05
         )
 
-        self.gdf_hydropower_locations["Capacity"].plot.hist(ax=ax[1], bins=20, log=True)
+        self.gdf_hydropower_locations[
+            (
+                self.gdf_hydropower_locations["WASTANumber"].isin(
+                    self.ds_hydropower_generation.hydropower.values
+                )
+            )
+            & (~pd.isna(self.gdf_hydropower_locations["Canton"]))
+        ]["Capacity"].plot.hist(ax=ax[1], bins=20, log=True)
         ax[1].set_xlabel("Capacity (in MW)", fontsize=FONTSIZE_LABELS)
         ax[1].set_ylabel("Log-Frequency", fontsize=FONTSIZE_LABELS)
         ax[1].set_title(
@@ -1911,7 +1918,7 @@ class NationalAnalysisHydropower:
         ax[1].set_xlim([min_x - 0.02, max_x + 0.02])
         ax[1].set_ylim([ylim[0] - 0.3, ylim[1] + 0.3])
         ax[1].set_yticks(ax[0].get_yticks(), ["  ", "  ", "  "])
-        ax[1].set_xlabel("Slope (TWh/year)", fontsize=6)
+        ax[1].set_xlabel("Slope (TWh/year)", fontsize=FONTSIZE_LABELS)
 
         ax[2].errorbar(
             summer_coeffs["coef"],
@@ -2345,6 +2352,7 @@ class NationalAnalysisHydropower:
         self,
         yearly: bool,
         variable_name: str,
+        with_operation_start: bool = False,
         save: bool = False,
         output_filename: str = None,
     ) -> None:
@@ -2370,13 +2378,6 @@ class NationalAnalysisHydropower:
 
         nb_plots_row = 10
         df_generation = self.create_dataframe_with_quantiles(yearly, variable_name)
-        capacity_upper_10 = capacity_upper_10 = self.gdf_hydropower_locations[
-            (
-                self.gdf_hydropower_locations["WASTANumber"].isin(
-                    self.ds_hydropower_generation.hydropower.values
-                )
-            )
-        ]["Capacity"].quantile(0.9)
 
         years = df_generation.index.get_level_values("time").unique()
         start_decade = int(np.floor(years[0] / 10.0) * 10)
@@ -2394,6 +2395,26 @@ class NationalAnalysisHydropower:
         for i, year in enumerate(years):
             row = year % 10
             col = (year - start_decade) // 10
+
+            wasta = (
+                self.gdf_hydropower_locations[
+                    (
+                        self.gdf_hydropower_locations["BeginningOfOperation"]
+                        <= year
+                    )
+                    & (
+                        self.gdf_hydropower_locations["WASTANumber"].isin(
+                            self.ds_hydropower_generation.hydropower.to_numpy()
+                        )
+                    )
+                ]["WASTANumber"].tolist()
+                if with_operation_start
+                else self.ds_hydropower_generation.hydropower.to_numpy()
+            )
+
+            capacity_upper_10 = self.gdf_hydropower_locations[
+                self.gdf_hydropower_locations["WASTANumber"].isin(wasta)
+            ]["Capacity"].quantile(0.9)
 
             gdf_hydropower_quantile_map = self.gdf_hydropower_locations.copy()
             gdf_hydropower_quantile_map = gdf_hydropower_quantile_map[
@@ -2551,10 +2572,7 @@ def plot_pre_post_bias_correction_validation(
         yearly_column_to_plot=yearly_column_to_plot,
         winter_column_to_plot=winter_column_to_plot,
         summer_column_to_plot=summer_column_to_plot,
-        subplots_titles=subplots_titles,
-        legend=False,
-        save=False,
-        output_filename=None,
+        subplots_titles=subplots_titles
     )
     axs[0, 0].text(
         x=-0.22,
@@ -2571,10 +2589,7 @@ def plot_pre_post_bias_correction_validation(
         yearly_column_to_plot=yearly_column_to_plot,
         winter_column_to_plot=winter_column_to_plot,
         summer_column_to_plot=summer_column_to_plot,
-        subplots_titles=subplots_titles,
-        legend=False,
-        save=False,
-        output_filename=None,
+        subplots_titles=subplots_titles
     )
     axs[1, 0].text(
         x=-0.22,
