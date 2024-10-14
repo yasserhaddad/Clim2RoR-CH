@@ -1322,7 +1322,7 @@ class NationalAnalysisHydropower:
         )
 
         if save and output_filename:
-            output_path = self.path_figs / "paper"
+            output_path = self.path_figs
             output_path.mkdir(exist_ok=True, parents=True)
             plt.savefig(
                 output_path / output_filename,
@@ -2048,7 +2048,7 @@ class NationalAnalysisHydropower:
         )
 
         if save and output_filename:
-            output_path = self.path_figs / "paper"
+            output_path = self.path_figs
             output_path.mkdir(exist_ok=True, parents=True)
             plt.savefig(
                 output_path / output_filename,
@@ -2153,7 +2153,7 @@ class NationalAnalysisHydropower:
         ax.tick_params(axis="both", which="minor", labelsize=FONTSIZE_TICKS)
 
         if save and output_filename:
-            output_path = self.path_figs / "paper"
+            output_path = self.path_figs
             output_path.mkdir(exist_ok=True, parents=True)
             plt.savefig(output_path / output_filename, dpi=300, bbox_inches="tight")
 
@@ -2342,7 +2342,7 @@ class NationalAnalysisHydropower:
         ax[1].tick_params(axis="both", which="minor", labelsize=FONTSIZE_TICKS)
 
         if save and output_filename:
-            output_path = self.path_figs / "paper"
+            output_path = self.path_figs
             output_path.mkdir(exist_ok=True, parents=True)
             plt.savefig(output_path / output_filename, dpi=300, bbox_inches="tight")
 
@@ -2519,9 +2519,58 @@ class NationalAnalysisHydropower:
         cbar.ax.set_position(pos2)
 
         if save and output_filename:
-            output_path = self.path_figs / "paper"
+            output_path = self.path_figs
             output_path.mkdir(exist_ok=True, parents=True)
             plt.savefig(output_path / output_filename, dpi=200, bbox_inches="tight")
+
+        plt.show()
+
+    def plot_hist_prod_quantile_threshold_per_decade(
+        self,
+        yearly: bool,
+        variable_name: str,
+        quantile_threshold: float,
+        higher_than: bool,
+        with_operation_start: bool = False,
+        save: bool = False,
+        output_filename: str = None,
+    ):
+        df_quantiles = self.create_dataframe_with_quantiles(yearly, variable_name)
+        df_quantiles["quantile_threshold"] = df_quantiles["quantile"].apply(lambda q: q >= quantile_threshold if higher_than else q <= quantile_threshold)
+        for year in df_quantiles.index.get_level_values(level=0).unique():
+            wasta = (
+                self.gdf_hydropower_locations[
+                    (
+                        self.gdf_hydropower_locations["BeginningOfOperation"]
+                        <= year
+                    )
+                    & (
+                        self.gdf_hydropower_locations["WASTANumber"].isin(
+                            self.ds_hydropower_generation.hydropower.to_numpy()
+                        )
+                    )
+                ]["WASTANumber"].tolist()
+                if with_operation_start
+                else self.ds_hydropower_generation.hydropower.to_numpy()
+            )
+            df_quantiles.loc[(year, wasta), "quantile_threshold"] = False
+
+        df_quantiles_threshold_per_year = df_quantiles.groupby("time").sum("quantile_threshold")[["quantile_threshold"]]
+        df_quantiles_threshold_per_year = df_quantiles_threshold_per_year.groupby((df_quantiles_threshold_per_year.index//10)*10).sum()
+
+        _, ax = plt.subplots(figsize=(7.5*cm, 6*cm))
+        df_quantiles_threshold_per_year.plot.bar(ax=ax, color=blue, legend=False)
+        ax.set_xlabel("")
+        ax.set_ylabel("Number of hydropower plants", fontsize=FONTSIZE_LABELS)
+
+        ax.tick_params(axis="both", which="major", labelsize=FONTSIZE_TICKS)
+        ax.tick_params(axis="both", which="minor", labelsize=FONTSIZE_TICKS)
+        plt.xticks(rotation=45)
+
+        if save and output_filename:
+            output_path = self.path_figs
+            output_path.mkdir(exist_ok=True, parents=True)
+            plt.savefig(output_path / output_filename, dpi=300, bbox_inches="tight")
 
         plt.show()
 
@@ -2613,7 +2662,7 @@ def plot_pre_post_bias_correction_validation(
     plt.tight_layout()
 
     if save and output_filename:
-        output_path = analysis_pre_correction.path_figs / "paper"
+        output_path = analysis_pre_correction.path_figs
         output_path.mkdir(exist_ok=True, parents=True)
         plt.savefig(
             output_path / output_filename,

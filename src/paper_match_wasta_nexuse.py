@@ -22,11 +22,13 @@ class MatchWastaNexuse:
         paths = json.load(open(paths_file))
         self.path_data = Path(paths["path_data"])
         self.path_data_nexuse = Path(paths["path_data_nexuse"])
-        self.path_data_streamflow = Path(paths["path_data_streamflow"])
         self.path_data_hydro = self.path_data / "hydropower"
 
+        self.nexuse_db_filename = nexuse_db_filename
         self.ds_hydropower_generation = xr.open_dataset(
-            self.path_data_streamflow / hydropower_generation_filename
+            self.path_data_hydro
+            / "hydropower_generation"
+            / hydropower_generation_filename
         )
 
         self.df_stats_hydropower_ch = pd.read_excel(
@@ -40,7 +42,8 @@ class MatchWastaNexuse:
                 "ZE-Standort",
                 "ZE-Kanton",
                 "WKA-Typ",
-                "Max. Leistung ab Generator",
+                '("LGENERATOR[MW]"/100)*"PROZ.ANTEILCH"',
+                '("PROD.OHNEUMWÄLZBETRIEB-J."/100)*"PROZ.ANTEILCH"',
                 "ZE-Erste Inbetriebnahme",
                 "ZE-Letzte Inbetriebnahme",
                 "ZE-Koordinaten unscharf (Ost)",
@@ -54,7 +57,8 @@ class MatchWastaNexuse:
                 "ZE-Standort": "Location",
                 "ZE-Kanton": "Canton",
                 "WKA-Typ": "Type",
-                "Max. Leistung ab Generator": "Capacity",
+                '("LGENERATOR[MW]"/100)*"PROZ.ANTEILCH"': "Capacity",
+                '("PROD.OHNEUMWÄLZBETRIEB-J."/100)*"PROZ.ANTEILCH"': "Expected Annual Gen (GWh)",
                 "ZE-Erste Inbetriebnahme": "BeginningOfOperation",
                 "ZE-Letzte Inbetriebnahme": "EndOfOperation",
                 "ZE-Koordinaten unscharf (Ost)": "_x",
@@ -301,16 +305,17 @@ class MatchWastaNexuse:
             empty, filled with 0s)
         """
 
-        def empty_inflow_row(row_gen, row_profile):
+        def empty_inflow_row(gen_name, row_profile):
             updated_row = row_profile.copy()
-            updated_row["Name"] = f"inflow_CH_Hydro_RoR_{row_gen['name']}"
+            updated_row["Name"] = f"inflow_CH_Hydro_RoR_{gen_name}"
             updated_row[6:8766] = 0
             updated_row[8767:8772] = 0
             return updated_row
 
-        df_nexuse_profiles_updated = self.df_nexuse_profiles[
-            ~self.df_nexuse_profiles["Name"].str.startswith("inflow_CH_Hydro_RoR")
-        ].copy()
+        self.df_nexuse_profiles["Old Profile Number"] = self.df_nexuse_profiles[
+            "Profile Number"
+        ]
+
         template_row_ror_profile = (
             self.df_nexuse_profiles[
                 self.df_nexuse_profiles["Name"].str.startswith("inflow_CH_Hydro_RoR")
@@ -318,28 +323,51 @@ class MatchWastaNexuse:
             .iloc[0]
             .copy()
         )
-        df_nexuse_profiles_updated_ror = df_nexuse_gens_ch_ror_updated.apply(
-            lambda row: empty_inflow_row(row, template_row_ror_profile), axis=1
+
+        start_profile_number_ror = template_row_ror_profile["Profile Number"]
+        last_profile_number_ror_current = self.df_nexuse_profiles.loc[
+            self.df_nexuse_profiles["Name"].str.startswith("inflow_CH_Hydro_RoR"),
+            "Profile Number",
+        ].iloc[-1]
+
+        last_profile_number_ror_updated = start_profile_number_ror + len(
+            df_nexuse_gens_ch_ror_updated
         )
 
-        start_profile_number_ror = (
-            df_nexuse_profiles_updated["Profile Number"].iloc[-1] + 1
+        df_nexuse_profiles_keep_before = self.df_nexuse_profiles.loc[
+            self.df_nexuse_profiles["Profile Number"] < start_profile_number_ror
+        ].copy()
+
+        df_nexuse_profiles_keep_after = self.df_nexuse_profiles.loc[
+            self.df_nexuse_profiles["Profile Number"] > last_profile_number_ror_current
+        ].copy()
+
+        df_nexuse_profiles_ror_updated = df_nexuse_gens_ch_ror_updated.apply(
+            lambda row: empty_inflow_row(row["name"], template_row_ror_profile), axis=1
         )
-        df_nexuse_profiles_updated_ror["Profile Number"] = list(
+
+        df_nexuse_profiles_ror_updated["Profile Number"] = list(
             range(
                 start_profile_number_ror,
-                start_profile_number_ror + len(df_nexuse_profiles_updated_ror),
+                last_profile_number_ror_updated,
             )
         )
-        df_nexuse_profiles_updated = pd.concat(
-            [df_nexuse_profiles_updated, df_nexuse_profiles_updated_ror]
-        ).reset_index(drop=True)
-        df_nexuse_profiles_updated.to_excel(
-            self.path_data_nexuse
-            / "database"
-            / f"{nexuse_db_filename.split('.')[0]}_new_profiles.xlsx",
-            sheet_name="profiles",
+
+        df_nexuse_profiles_keep_after["Profile Number"] = list(
+            range(
+                last_profile_number_ror_updated,
+                last_profile_number_ror_updated
+                + len(df_nexuse_profiles_keep_after),
+            )
         )
+
+        df_nexuse_profiles_updated = pd.concat(
+            [
+                df_nexuse_profiles_keep_before,
+                df_nexuse_profiles_ror_updated,
+                df_nexuse_profiles_keep_after,
+            ]
+        ).reset_index(drop=True)
 
         return df_nexuse_profiles_updated
 
@@ -347,7 +375,6 @@ class MatchWastaNexuse:
         self,
         df_nexuse_gens_ch_ror_updated: pd.DataFrame,
         df_nexuse_profiles_updated: pd.DataFrame,
-        nexuse_db_filename: str,
     ) -> pd.DataFrame:
         """Update the profile number of Nexus-e generators, the unchanged ones
         as well as the updated RoR power plants from the WASTA database, and
@@ -363,8 +390,6 @@ class MatchWastaNexuse:
             pandas DataFrame containing profiles for all power plants in Nexus-e database
             and including RoR power plants from the WASTA database (profiles of which are
             empty, filled with 0s)
-        nexuse_db_filename : str
-            Name of the Nexus-e database file to be updated
 
         Returns
         -------
@@ -408,19 +433,60 @@ class MatchWastaNexuse:
                 "Profile Number",
             ].item(),
             axis=1,
-        )
+        ).tolist()
+
+        df_nexuse_gens_updated.loc[
+            ((~df_nexuse_gens_updated["Gen_ID"].str.startswith("CH_Hydro_RoR"))
+            & (~df_nexuse_gens_updated["idProfile"].isna())),
+            "idProfile",
+        ] = df_nexuse_gens_updated.loc[
+            ((~df_nexuse_gens_updated["Gen_ID"].str.startswith("CH_Hydro_RoR"))
+            & (~df_nexuse_gens_updated["idProfile"].isna()))
+        ].apply(
+            lambda row: df_nexuse_profiles_updated.loc[
+                (df_nexuse_profiles_updated["Old Profile Number"] == row["idProfile"]),
+                "Profile Number",
+            ].item(),
+            axis=1,
+        ).tolist()
+
         df_nexuse_gens_updated["GenNum"] = list(
             range(1, len(df_nexuse_gens_updated) + 1)
         )
 
+        return df_nexuse_gens_updated
+
+    def save_new_gens_and_profiles(
+        self,
+        df_nexuse_gens_updated: pd.DataFrame,
+        df_nexuse_profiles_updated: pd.DataFrame,
+    ) -> None:
+        """Saves the new list of generators and their corresponding profiles to an
+        two separate Excel spreadsheets.
+
+        Parameters
+        ----------
+        df_nexuse_gens_updated : pd.DataFrame
+            pandas DataFrame of Nexus-e generators information, including updated
+            RoR power plants from the WASTA database, with updated profile numbers
+        df_nexuse_profiles_updated : pd.DataFrame
+            pandas DataFrame containing profiles for all power plants in Nexus-e database
+            and including RoR power plants from the WASTA database (profiles of which are
+            empty, filled with 0s)
+        """
         df_nexuse_gens_updated.to_excel(
             self.path_data_nexuse
             / "database"
-            / f"{nexuse_db_filename.split('.')[0]}_new_gens.xlsx",
+            / f"{self.nexuse_db_filename.split('.')[0]}_new_gens.xlsx",
             sheet_name="gens",
         )
 
-        return df_nexuse_gens_updated
+        df_nexuse_profiles_updated.drop(columns=["Old Profile Number"]).to_excel(
+            self.path_data_nexuse
+            / "database"
+            / f"{self.nexuse_db_filename.split('.')[0]}_new_profiles.xlsx",
+            sheet_name="profiles",
+        )
 
     def get_profile_generator(
         self,
@@ -498,7 +564,9 @@ class MatchWastaNexuse:
             empty, filled with 0s)
         """
         ds_monthly_bias_correction_factors = xr.open_dataset(
-            self.path_data_streamflow / bias_correction_factors_filename
+            self.path_data_hydro
+            / "hydropower_generation"
+            / bias_correction_factors_filename
         ).load()
         ds_hydropower_generation_monthly_bias_corrected = (
             self.ds_hydropower_generation
@@ -542,8 +610,10 @@ if __name__ == "__main__":
         df_nexuse_gens_ch_ror_updated, nexuse_db_filename
     )
     df_nexuse_gens_updated = match.update_gens_profile_number(
-        df_nexuse_gens_ch_ror_updated, df_nexuse_profiles_updated, nexuse_db_filename
+        df_nexuse_gens_ch_ror_updated, df_nexuse_profiles_updated
     )
+
+    match.save_new_gens_and_profiles(df_nexuse_gens_updated, df_nexuse_profiles_updated)
 
     monthly_bias_correction_factors_filename = "ds_prevah_500_hydropower_production_ror_simplified_efficiency_monthly_bias_correction_factors.nc"
     match.create_profiles_estimated_generation(
