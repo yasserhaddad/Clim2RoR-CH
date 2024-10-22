@@ -51,10 +51,9 @@ DEFAULT_EFFICIENCY = 0.8
 class DataProcessing:
     def __init__(self, paths_file: str):
         paths = json.load(open(paths_file))
-        self.path_prevah = Path(paths["path_prevah"])
         self.path_data = Path(paths["path_data"])
-        self.path_data_streamflow = Path(paths["path_data_streamflow"])
 
+        self.path_data_prevah = self.path_data / "prevah"
         self.path_data_hydro = self.path_data / "hydropower"
         self.path_data_polygons = self.path_data / "polygons"
 
@@ -124,18 +123,13 @@ class DataProcessing:
 
         self.df_hydropower_polygons = None
         self.ds_accumulated_streamflow_polygon = None
-        self.df_reported_generation = pd.read_csv(
-            self.path_data
-            / "energy"
-            / "ogd35_schweizerische_elektrizitaetsbilanz_monatswerte.csv"
-        )
 
     def convert_bin_to_netcdf_runoff_prevah(self) -> None:
         """Extracts runoff values from gz binary PREVAH data and stores them in
         netcdf files. Each file contains one year of data.
         """
-        path_hydro_tar = self.path_prevah / "compressed"
-        netcdf_output_dir = self.path_prevah / "netcdf"
+        path_hydro_tar = self.path_data_prevah / "compressed"
+        netcdf_output_dir = self.path_data_prevah / "netcdf"
         if netcdf_output_dir.exists():
             shutil.rmtree(netcdf_output_dir)
         netcdf_output_dir.mkdir(exist_ok=True)
@@ -147,11 +141,13 @@ class DataProcessing:
             product,
             prefix_filename_tgz="wsl2zero_",
             prefix_filename_gz="Mob500",
+            convert_coords=True,
             num_workers=8,
         )
 
     def extract_points_in_polygons(
-        self, output_filename: str = "df_prevah_500_pts_in_polygons.csv"
+        self,
+        output_filename: str = "df_prevah_500_pts_in_polygons.csv"
     ) -> None:
         """Extracts points from the PREVAH grid that are located in the polygons of Swiss waterbodies.
 
@@ -162,11 +158,9 @@ class DataProcessing:
             by default "df_prevah_500_pts_in_polygons.csv"
         """
         # Load sample runoff data
-        ds_sample = transform_coords_old_to_new_swiss(
-            xr.open_dataset(
-                self.path_prevah / "netcdf" / "Mob500_RGS_2002.nc"
+        ds_sample = xr.open_dataset(
+                list((self.path_data_prevah / "netcdf").glob("*.nc"))[0]
             )
-        )
 
         # Transform a sample runoff grid into a GeoDataFrame to use operations included in GeoPandas
         df_runoff = ds_sample.isel(time=0).to_dataframe().reset_index()
@@ -233,9 +227,9 @@ class DataProcessing:
         list_ds_accum_streamflow = []
 
         time_start = time.time()
-        for path_rgs in list((self.path_prevah / "netcdf").glob("*")):
+        for path_rgs in list((self.path_data_prevah / "netcdf").glob("*")):
             year = path_rgs.stem.split("Mob500_RGS_")[1]
-            ds_rgs = transform_coords_old_to_new_swiss(xr.open_dataset(path_rgs)).apply(
+            ds_rgs = xr.open_dataset(path_rgs).apply(
                 lambda v: convert_mm_d_to_cubic_m_s(v, 500 * 500)
             )
             list_ds_accum_streamflow.append(
@@ -260,7 +254,7 @@ class DataProcessing:
             "units": f"seconds since {np.datetime_as_string(ds_accum.time[0].values)}"
         }
 
-        output_filepath = self.path_data_streamflow / f"{output_filename}.nc"
+        output_filepath = self.path_data_prevah / f"{output_filename}.nc"
         if output_filepath.is_file():
             output_filepath.unlink()
 
@@ -277,7 +271,7 @@ class DataProcessing:
             method="ffill",
         ).drop_sel(time=DATES_TO_REMOVE)
 
-        output_filepath = self.path_data_streamflow / f"{output_filename}_hourly.nc"
+        output_filepath = self.path_data_prevah / f"{output_filename}_hourly.nc"
         if output_filepath.is_file():
             output_filepath.unlink()
 
@@ -557,7 +551,7 @@ class DataProcessing:
         # Load accumulated streamflow per polygon
         if not self.ds_accumulated_streamflow_polygon:
             self.ds_accumulated_streamflow_polygon = xr.open_dataset(
-                self.path_data_streamflow / accumulated_streamflow_per_polygon_filename
+                self.path_data_prevah / accumulated_streamflow_per_polygon_filename
             ).load()
 
         # --------------------------------------------------------------------------------------------------
@@ -688,25 +682,25 @@ class DataProcessing:
             )
 
             output_filepath = (
-                self.path_data_streamflow
+                self.path_data_hydro / "hydropower_generation"
                 / f"{output_filename_prefix}_simplified_efficiency.nc"
             )
             concat_list_ds_and_save(list_ds, output_filepath)
 
             output_filepath = (
-                self.path_data_streamflow
+                self.path_data_hydro / "hydropower_generation"
                 / f"{output_filename_prefix}_simplified_efficiency_with_beta.nc"
             )
             concat_list_ds_and_save(list_ds_with_beta, output_filepath)
 
             output_filepath = (
-                self.path_data_streamflow
+                self.path_data_hydro / "hydropower_generation"
                 / f"{output_filename_prefix}_simplified_efficiency_with_beta_less_than_1.nc"
             )
             concat_list_ds_and_save(list_ds_with_beta_less_than_1, output_filepath)
 
             pd.DataFrame(list_parameters).to_csv(
-                self.path_data_streamflow / f"{output_filename_prefix}_parameters.csv",
+                self.path_data_hydro / "hydropower_generation" / f"{output_filename_prefix}_parameters.csv",
                 index=False,
             )
 
@@ -731,8 +725,14 @@ class DataProcessing:
             replicated for each timestep in the hydropower generation xarray Dataset,
             by default "ds_monthly_bias_correction_factors.nc"
         """
+        self.df_reported_generation = pd.read_csv(
+            self.path_data
+            / "energy"
+            / "ogd35_schweizerische_elektrizitaetsbilanz_monatswerte.csv"
+        )
+
         ds_hydropower_generation = xr.open_dataset(
-            self.path_data_streamflow / hydropower_generation_filename
+            self.path_data_hydro / "hydropower_generation" / hydropower_generation_filename
         )
         df_reported_generation_ror = self.df_reported_generation[
             self.df_reported_generation.Jahr < 2023
@@ -779,7 +779,7 @@ class DataProcessing:
             coords={"time": (["time"], ds_hydropower_generation.time.values)},
         )
         ds_monthly_bias_correction_factors.rename("bias_correction_factor").to_netcdf(
-            self.path_data_streamflow / output_filename
+            self.path_data_hydro / "hydropower_generation" / output_filename
         )
 
 

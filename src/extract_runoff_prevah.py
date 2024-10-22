@@ -135,7 +135,7 @@ def extract_hydro_tgz(
 
 
 def combine_ds_to_netcdf(
-    list_ds: List[xr.Dataset], output_dir_path: pathlib.Path, output_filename: str = ""
+    list_ds: List[xr.Dataset], convert_coords: bool, output_dir_path: pathlib.Path, output_filename: str = ""
 ) -> None:
     """Combines multiple xarray Datasets into one and saves the combined
     xarray Dataset into a netcdf file.
@@ -144,6 +144,9 @@ def combine_ds_to_netcdf(
     ----------
     list_ds : List[xr.Dataset]
         List of xarray Datasets to combine
+    convert_coords : bool
+        Whether to conver the coordinates from the old Swiss
+        system (LV95) to the new system (LV03)
     output_dir_path : pathlib.Path
         Path to output directory where the netcdf will be saved
     output_filename : str, optional
@@ -168,6 +171,9 @@ def combine_ds_to_netcdf(
         print(f"| More than 1 year in this dataset ({years}) | ", end="")
         concat_ds = concat_ds.sel(time=str(years[0]))
 
+    if convert_coords:
+        concat_ds = transform_coords_old_to_new_swiss(concat_ds)
+
     if output_filename == "":
         output_filename = (
             f"{product}_{pd.to_datetime(concat_ds.time[0].values).year}.nc"
@@ -186,6 +192,7 @@ def batch_extraction_prevah(
     product: str,
     prefix_filename_tgz: str = "",
     prefix_filename_gz: str = "",
+    convert_coords: bool = True,
     # fill_value: float = np.nan,
     num_workers: int = 2,
 ):
@@ -208,6 +215,9 @@ def batch_extraction_prevah(
     prefix_filename_gz : str, optional
         String that identifies the type of simulation (e.g. Mob500),
         that precedes the date in the filename, by default ""
+    convert_coords : bool, optional
+        Whether to conver the coordinates from the old Swiss
+        system (LV95) to the new system (LV03), by default True
     num_workers : int, optional
         Number of parallel workers to speed up the extraction
         process, by default 2
@@ -256,7 +266,7 @@ def batch_extraction_prevah(
             output_filename = f"{product}_{year}.nc"
             if prefix_filename_gz != "":
                 output_filename = f"{prefix_filename_gz}_" + output_filename
-            combine_ds_to_netcdf(list_ds, netcdf_dir, output_filename)
+            combine_ds_to_netcdf(list_ds, convert_coords, netcdf_dir, output_filename)
 
         del list_ds
 
