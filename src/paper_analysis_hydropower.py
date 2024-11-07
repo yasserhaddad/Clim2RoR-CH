@@ -1235,7 +1235,7 @@ class NationalAnalysisHydropower:
         return coef, intercept, pred, conf_interval
 
     def plot_ror_map_capacities_hist(
-        self, save: bool = False, output_filename: str = None
+        self, save: bool = False, output_filename: str = None, file_format: str = "pdf"
     ) -> None:
         """Plot a map of the location of RoR hydropower plants in the WASTA database, along
         with a histogram of their capacities.
@@ -1246,6 +1246,8 @@ class NationalAnalysisHydropower:
             Whether to save the plot, by default False
         output_filename : str, optional
             The name of the file containing the plot, by default None
+        file_format : str, optional
+            Format of the file to save the figure to, by default "pdf"
         """
         fig, ax = plt.subplots(1, 2, figsize=(15 * cm, 6 * cm), width_ratios=[2, 1])
         capacity_upper_10 = self.gdf_hydropower_locations[
@@ -1257,7 +1259,7 @@ class NationalAnalysisHydropower:
         ]["Capacity"].quantile(0.9)
 
         self.gdf_switzerland.plot(
-            ax=ax[0], color="white", edgecolor="black", rasterized=True
+            ax=ax[0], color="white", edgecolor="black", rasterized=(file_format=="eps")
         )
         self.gdf_hydropower_locations[
             (
@@ -1273,7 +1275,7 @@ class NationalAnalysisHydropower:
             color=blue,
             marker=".",
             markersize=4,
-            rasterized=True,
+            rasterized=(file_format == "eps"),
         )
         self.gdf_hydropower_locations[
             (
@@ -1289,7 +1291,7 @@ class NationalAnalysisHydropower:
             color=red,
             marker=".",
             markersize=20,
-            rasterized=True,
+            rasterized=(file_format == "eps"),
         )
 
         ax[0].axis("off")
@@ -1304,7 +1306,7 @@ class NationalAnalysisHydropower:
                 )
             )
             & (~pd.isna(self.gdf_hydropower_locations["Canton"]))
-        ]["Capacity"].plot.hist(ax=ax[1], bins=20, log=True)
+        ]["Capacity"].plot.hist(ax=ax[1], bins=20, log=True, rasterized=(file_format == "eps"))
         ax[1].set_xlabel("Capacity (in MW)", fontsize=FONTSIZE_LABELS)
         ax[1].set_ylabel("Log-Frequency", fontsize=FONTSIZE_LABELS)
         ax[1].set_title(
@@ -1342,7 +1344,7 @@ class NationalAnalysisHydropower:
             output_path.mkdir(exist_ok=True, parents=True)
             plt.savefig(
                 output_path / output_filename,
-                format="eps",
+                format=file_format,
                 dpi=300,
                 bbox_inches="tight",
             )
@@ -1357,6 +1359,7 @@ class NationalAnalysisHydropower:
         winter_column_to_plot: str = None,
         summer_column_to_plot: str = None,
         subplots_titles: List[str] = None,
+        rasterize: bool = False
     ) -> None:
         """Plot a comparison of the yearly and seasonal estimated generation with
         the reported generation.
@@ -1379,6 +1382,8 @@ class NationalAnalysisHydropower:
             values, by default None
         subplots_titles : List[str], optional
             Titles of the three subplots, by default None
+        rasterize : bool, optional
+            Wehether to raster the plots, by default False
         """
         df_hydropower_yearly = self.create_dataframe_yearly_values(
             with_operation_start=True, with_percentage=with_percentage
@@ -1430,10 +1435,11 @@ class NationalAnalysisHydropower:
             label="Estimated Generation",
             legend=False,
             color=blue,
-            rasterized=True,
+            rasterized=rasterize,
         )
         df_hydropower_yearly.plot(
-            y="Reported Generation", ax=ax[0], legend=False, color=red, rasterized=True
+            y="Reported Generation", ax=ax[0], legend=False,
+            color=red, rasterized=rasterize
         )
         ax[0].set_ylim(min_val - 1.0, max_val + 1.0)
         if subplots_titles:
@@ -1450,7 +1456,7 @@ class NationalAnalysisHydropower:
             label="Estimated Generation",
             legend=False,
             color=blue,
-            rasterized=True,
+            rasterized=rasterize,
         )
         df_hydropower_seasonal.plot(
             y="Reported Generation Winter",
@@ -1458,7 +1464,7 @@ class NationalAnalysisHydropower:
             label="Reported Generation",
             legend=False,
             color=red,
-            rasterized=True,
+            rasterized=rasterize,
         )
         ax[1].set_ylim(min_val_winter - 1.0, max_val_winter + 1.0)
         ax[1].set_yticks(np.arange(3, 10, 2))
@@ -1501,6 +1507,7 @@ class NationalAnalysisHydropower:
         winter_column_to_plot: str = None,
         summer_column_to_plot: str = None,
         subplots_titles: List[str] = None,
+        rasterize: bool = False
     ):
         """Plot a comparison of the yearly and seasonal estimated generation for
         three different aggregation methods: evolving capacities, fixed capacities
@@ -1524,6 +1531,8 @@ class NationalAnalysisHydropower:
             values, by default None
         subplots_titles : List[str], optional
             Titles of the three subplots, by default None
+        rasterize : bool, optional
+            Wehether to raster the plots, by default False
         """
         df_hydropower_yearly = (
             self.create_dataframe_yearly_values(
@@ -1602,7 +1611,7 @@ class NationalAnalysisHydropower:
             label="Estimated Generation",
             legend=False,
             color=blue,
-            rasterized=True,
+            rasterized=rasterize,
         )
         df_hydropower_yearly.plot(
             y=yearly_column_to_plot + "_fixed_system_2022",
@@ -1610,7 +1619,7 @@ class NationalAnalysisHydropower:
             legend=False,
             color=green,
             alpha=0.8,
-            rasterized=True,
+            rasterized=rasterize,
         )
 
         df_hydropower_yearly.plot(
@@ -1619,7 +1628,7 @@ class NationalAnalysisHydropower:
             legend=False,
             color=orange,
             alpha=0.8,
-            rasterized=True,
+            rasterized=rasterize,
         )
         ax[0].set_ylabel("Generation (in TWh)", fontsize=FONTSIZE_LABELS)
         ax[0].set_ylim(min_val - 1.0, max_val + 1.0)
@@ -1639,7 +1648,7 @@ class NationalAnalysisHydropower:
             label="Estimated Generation",
             legend=False,
             color=blue,
-            rasterized=True,
+            rasterized=rasterize,
         )
 
         df_hydropower_seasonal.plot(
@@ -1648,7 +1657,7 @@ class NationalAnalysisHydropower:
             legend=False,
             color=green,
             alpha=0.8,
-            rasterized=True,
+            rasterized=rasterize,
         )
 
         df_hydropower_seasonal.plot(
@@ -1657,7 +1666,7 @@ class NationalAnalysisHydropower:
             legend=False,
             color=orange,
             alpha=0.8,
-            rasterized=True,
+            rasterized=rasterize,
         )
 
         subplot_title = (
@@ -1680,7 +1689,7 @@ class NationalAnalysisHydropower:
             label="Estimated Generation (evolving capacities)",
             color=blue,
             legend=False,
-            rasterized=True,
+            rasterized=rasterize,
         )
 
         df_hydropower_seasonal.plot(
@@ -1690,7 +1699,7 @@ class NationalAnalysisHydropower:
             legend=False,
             color=green,
             alpha=0.8,
-            rasterized=True,
+            rasterized=rasterize,
         )
 
         df_hydropower_seasonal.plot(
@@ -1700,7 +1709,7 @@ class NationalAnalysisHydropower:
             legend=False,
             color=orange,
             alpha=0.8,
-            rasterized=True,
+            rasterized=rasterize,
         )
 
         subplot_title = (
@@ -1773,6 +1782,7 @@ class NationalAnalysisHydropower:
         yearly_column_to_plot: str = None,
         winter_column_to_plot: str = None,
         summer_column_to_plot: str = None,
+        rasterize: bool = False
     ):
         """Plot a comparison of the trend slopes for yearly and seasonal
         estimated generation for three different aggregation methods: evolving capacities,
@@ -1794,6 +1804,8 @@ class NationalAnalysisHydropower:
         summer_column_to_plot : str, optional
             Name of the column in the DataFrame that contains the summer
             values, by default None
+        rasterize : bool, optional
+            Wehether to raster the plots, by default False
         """
         df_hydropower_yearly = (
             self.create_dataframe_yearly_values(
@@ -1919,9 +1931,11 @@ class NationalAnalysisHydropower:
             ecolor=colors_with_alpha,
             linewidth=0,
             elinewidth=1,
+            rasterized=rasterize
         )
         ax[0].scatter(
-            yearly_coeffs["coef"], yearly_coeffs["name"], color=colors_with_alpha
+            yearly_coeffs["coef"], yearly_coeffs["name"], color=colors_with_alpha,
+            rasterized=rasterize
         )
         ax[0].axvline(0, color="black", alpha=0.7, linestyle="--")
 
@@ -1940,9 +1954,11 @@ class NationalAnalysisHydropower:
             ecolor=colors_with_alpha,
             linewidth=0,
             elinewidth=1,
+            rasterized=rasterize
         )
         ax[1].scatter(
-            winter_coeffs["coef"], winter_coeffs["name"], color=colors_with_alpha
+            winter_coeffs["coef"], winter_coeffs["name"], color=colors_with_alpha,
+            rasterized=rasterize
         )
         ax[1].axvline(0, color="black", alpha=0.7, linestyle="--")
 
@@ -1960,9 +1976,11 @@ class NationalAnalysisHydropower:
             ecolor=colors_with_alpha,
             linewidth=0,
             elinewidth=1,
+            rasterized=rasterize
         )
         ax[2].scatter(
-            summer_coeffs["coef"], summer_coeffs["name"], color=colors_with_alpha
+            summer_coeffs["coef"], summer_coeffs["name"], color=colors_with_alpha,
+            rasterized=rasterize
         )
         ax[2].axvline(0, color="black", alpha=0.7, linestyle="--")
         ax[2].set_xlim([min_x - 0.02, max_x + 0.02])
@@ -1982,6 +2000,7 @@ class NationalAnalysisHydropower:
         subplots_titles: List[str] = None,
         save: bool = False,
         output_filename: str = None,
+        file_format: str = "pdf"
     ):
         """Plot a comparison of the yearly and seasonal estimated generation and
         their trend slopes for three different aggregation methods: evolving capacities,
@@ -2007,6 +2026,8 @@ class NationalAnalysisHydropower:
             Whether to save the plot, by default False
         output_filename : str, optional
             The name of the file containing the plot, by default None
+        file_format : str, optional
+            Format of the file to save the figure to, by default "pdf"
         """
         fig, axs = plt.subplots(2, 3, figsize=(15 * cm, 9 * cm), height_ratios=[1.8, 1])
         self.plot_infrastructure_trend(
@@ -2016,6 +2037,7 @@ class NationalAnalysisHydropower:
             winter_column_to_plot=winter_column_to_plot,
             summer_column_to_plot=summer_column_to_plot,
             subplots_titles=subplots_titles,
+            rasterize=(file_format=="eps")
         )
         axs[0, 0].text(
             x=-0.22,
@@ -2032,6 +2054,7 @@ class NationalAnalysisHydropower:
             yearly_column_to_plot=yearly_column_to_plot,
             winter_column_to_plot=winter_column_to_plot,
             summer_column_to_plot=summer_column_to_plot,
+            rasterize=(file_format=="eps")
         )
         axs[1, 0].text(
             x=-0.22,
@@ -2083,7 +2106,7 @@ class NationalAnalysisHydropower:
             output_path.mkdir(exist_ok=True, parents=True)
             plt.savefig(
                 output_path / output_filename,
-                format="eps",
+                format=file_format,
                 dpi=300,
                 bbox_inches="tight",
             )
@@ -2136,7 +2159,8 @@ class NationalAnalysisHydropower:
         return coeffs
 
     def plot_trend_analysis_per_month(
-        self, variable_name: str, save: bool = False, output_filename: str = None
+        self, variable_name: str, save: bool = False, output_filename: str = None,
+        file_format: str = "pdf"
     ) -> None:
         """Plot a comparison of the monthly trend slopes of the estimated generation
         along with their confidence intervals.
@@ -2149,6 +2173,8 @@ class NationalAnalysisHydropower:
             Whether to save the plot, by default False
         output_filename : str, optional
             The name of the file containing the plot, by default None
+        file_format : str, optional
+            Format of the file to save the figure to, by default "pdf"
         """
         df_hydropower_generation_per_month = (
             self.create_dataframe_monthly_estimated_generation(
@@ -2173,6 +2199,7 @@ class NationalAnalysisHydropower:
             color="black",
             linewidth=0,
             elinewidth=1,
+            rasterized=(file_format=="eps")
         )
         ax.axvline(0, color="black", alpha=0.5, linestyle="--")
 
@@ -2188,7 +2215,7 @@ class NationalAnalysisHydropower:
             output_path.mkdir(exist_ok=True, parents=True)
             plt.savefig(
                 output_path / output_filename,
-                format="eps",
+                format=file_format,
                 dpi=300,
                 bbox_inches="tight",
             )
@@ -2202,6 +2229,7 @@ class NationalAnalysisHydropower:
         with_first_year_infrastructure: bool = False,
         save: bool = False,
         output_filename: str = None,
+        file_format: str = "pdf"
     ) -> None:
         """Plot a map of the quantiles of yearly or seasonal generation for each
         RoR hydropower plants in the WASTA database.
@@ -2221,6 +2249,8 @@ class NationalAnalysisHydropower:
             Whether to save the plot, by default False
         output_filename : str, optional
             The name of the file containing the plot, by default None
+        file_format : str, optional
+            Format of the file to save the figure to, by default "pdf"
         """
         df_hydropower_generation_per_hp_winter = (
             self.create_dataframe_seasonal_estimated_values_per_hp(
@@ -2288,7 +2318,7 @@ class NationalAnalysisHydropower:
         fig, ax = plt.subplots(1, 2, figsize=(15 * cm, 7 * cm), width_ratios=(2, 1))
 
         self.gdf_switzerland.plot(
-            ax=ax[0], color="white", edgecolor="black", linewidth=0.5, rasterized=True
+            ax=ax[0], color="white", edgecolor="black", linewidth=0.5, rasterized=(file_format=="eps")
         )
 
         gdf_hydropower_coef_map[
@@ -2300,7 +2330,7 @@ class NationalAnalysisHydropower:
             marker=".",
             s=4,
             cmap=cmap,
-            rasterized=True,
+            rasterized=(file_format=="eps"),
         )
 
         gdf_hydropower_coef_map[
@@ -2314,7 +2344,7 @@ class NationalAnalysisHydropower:
             edgecolor="black",
             linewidth=1,
             cmap=cmap,
-            rasterized=True,
+            rasterized=(file_format=="eps"),
         )
         ax[0].axis("off")
         ax[0].tick_params(left=False, labelleft=False, bottom=False, labelbottom=False)
@@ -2330,7 +2360,7 @@ class NationalAnalysisHydropower:
             .unstack(fill_value=0)
         )
         df_frequency_categories.plot.bar(
-            ax=ax[1], stacked=True, legend=False, color=colors, rasterized=True
+            ax=ax[1], stacked=True, legend=False, color=colors, rasterized=(file_format=="eps")
         )
 
         ax[1].set_xticks(
@@ -2384,7 +2414,7 @@ class NationalAnalysisHydropower:
             output_path.mkdir(exist_ok=True, parents=True)
             plt.savefig(
                 output_path / output_filename,
-                format="eps",
+                format=file_format,
                 dpi=300,
                 bbox_inches="tight",
             )
@@ -2398,6 +2428,7 @@ class NationalAnalysisHydropower:
         with_operation_start: bool = False,
         save: bool = False,
         output_filename: str = None,
+        file_format: str = "pdf"
     ) -> None:
         """Plot a map of the quantiles of yearly or seasonal generation for each
         RoR hydropower plants in the WASTA database.
@@ -2413,6 +2444,8 @@ class NationalAnalysisHydropower:
             Whether to save the plot, by default False
         output_filename : str, optional
             The name of the file containing the plot, by default None
+        file_format : str, optional
+            Format of the file to save the figure to, by default "pdf"
         """
         num_bins = 10
         colormap = plt.get_cmap("RdBu")
@@ -2484,7 +2517,7 @@ class NationalAnalysisHydropower:
                 color="white",
                 edgecolor="black",
                 linewidth=0.5,
-                rasterized=True,
+                rasterized=(file_format=="eps"),
             )
 
             gdf_hydropower_quantile_map[
@@ -2496,7 +2529,7 @@ class NationalAnalysisHydropower:
                 marker=".",
                 s=0.8,
                 cmap=cmap,
-                rasterized=True,
+                rasterized=(file_format=="eps"),
             )
 
             gdf_hydropower_quantile_map[
@@ -2510,7 +2543,7 @@ class NationalAnalysisHydropower:
                 edgecolor="black",
                 linewidth=0.6,
                 cmap=cmap,
-                rasterized=True,
+                rasterized=(file_format=="eps"),
             )
 
             axs[row, col].set_title(year, fontsize=6, loc="left", y=0.7)
@@ -2566,7 +2599,7 @@ class NationalAnalysisHydropower:
             output_path.mkdir(exist_ok=True, parents=True)
             plt.savefig(
                 output_path / output_filename,
-                format="eps",
+                format=file_format,
                 dpi=200,
                 bbox_inches="tight",
             )
@@ -2582,7 +2615,30 @@ class NationalAnalysisHydropower:
         with_operation_start: bool = False,
         save: bool = False,
         output_filename: str = None,
+        file_format: str = "pdf"
     ):
+        """Plot number of total hydropower production years per decade below or above a certain quantile
+        threshold. This is summed over all hydropower plants.
+
+        Parameters
+        ----------
+        yearly : bool
+            _description_
+        variable_name : str
+            _description_
+        quantile_threshold : float
+            _description_
+        higher_than : bool
+            _description_
+        with_operation_start : bool, optional
+            _description_, by default False
+        save : bool, optional
+            _description_, by default False
+        output_filename : str, optional
+            _description_, by default None
+        file_format : str, optional
+            Format of the file to save the figure to, by default "pdf"
+        """
         df_quantiles = self.create_dataframe_with_quantiles(yearly, variable_name)
         df_quantiles["quantile_threshold"] = df_quantiles["quantile"].apply(
             lambda q: q >= quantile_threshold
@@ -2613,7 +2669,7 @@ class NationalAnalysisHydropower:
 
         _, ax = plt.subplots(figsize=(7.5 * cm, 6 * cm))
         df_quantiles_threshold_per_year.plot.bar(
-            ax=ax, color=blue, legend=False, rasterized=True
+            ax=ax, color=blue, legend=False, rasterized=(file_format=="eps")
         )
         ax.set_xlabel("")
         ax.set_ylabel("Number of hydropower plants", fontsize=FONTSIZE_LABELS)
@@ -2627,7 +2683,7 @@ class NationalAnalysisHydropower:
             output_path.mkdir(exist_ok=True, parents=True)
             plt.savefig(
                 output_path / output_filename,
-                format="eps",
+                format=file_format,
                 dpi=300,
                 bbox_inches="tight",
             )
@@ -2645,6 +2701,7 @@ def plot_pre_post_bias_correction_validation(
     subplots_titles: List[str] = None,
     save: bool = False,
     output_filename: str = None,
+    file_format: str = "pdf"
 ):
     """Plot a comparison of the yearly and seasonal estimated generation with
         the reported generation, before and after bias correcting the estimates.
@@ -2673,6 +2730,8 @@ def plot_pre_post_bias_correction_validation(
         Whether to save the plot, by default False
     output_filename : str, optional
         The name of the file containing the plot, by default None
+    file_format : str, optional
+            Format of the file to save the figure to, by default "pdf"
     """
     fig, axs = plt.subplots(2, 3, figsize=(15 * cm, 10 * cm))
     analysis_pre_correction.plot_validation(
@@ -2726,7 +2785,7 @@ def plot_pre_post_bias_correction_validation(
         output_path.mkdir(exist_ok=True, parents=True)
         plt.savefig(
             output_path / output_filename,
-            format="eps",
+            format=file_format,
             dpi=300,
             bbox_inches="tight",
         )
