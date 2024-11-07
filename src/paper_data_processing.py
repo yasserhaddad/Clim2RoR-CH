@@ -796,19 +796,19 @@ class DataProcessing:
 
 
 if __name__ == "__main__":
-    data_processing = DataProcessing("paths.json")
-    data_processing.convert_bin_to_netcdf_runoff_prevah()
+    data_processing = DataProcessing("paths_megadroughts.json")
+    # data_processing.convert_bin_to_netcdf_runoff_prevah()
     data_processing.extract_points_in_polygons()
-    data_processing.compute_accumulated_streamflow_per_polygon()
+    data_processing.compute_accumulated_streamflow_per_polygon(prefix="EMC8_2015-2019_RGS_")
     data_processing.get_catchment_area_per_hydropower()
     data_processing.compute_hydropower_production()
 
-    hydropower_generation_dataset_filename = (
-        "ds_prevah_500_hydropower_production_ror_simplified_efficiency.nc"
-    )
-    monthly_bias_correction_factors_filename = (
-        "ds_prevah_500_hydropower_production_ror_simplified_efficiency_monthly_bias_correction_factors.nc"
-    )
-    data_processing.compute_monthly_bias_correction_factors(
-        hydropower_generation_dataset_filename, monthly_bias_correction_factors_filename
-    )
+    # hydropower_generation_dataset_filename = (
+    #     "ds_prevah_500_hydropower_production_ror_simplified_efficiency.nc"
+    # )
+    # monthly_bias_correction_factors_filename = (
+    #     "ds_prevah_500_hydropower_production_ror_simplified_efficiency_monthly_bias_correction_factors.nc"
+    # )
+    # data_processing.compute_monthly_bias_correction_factors(
+    #     hydropower_generation_dataset_filename, monthly_bias_correction_factors_filename
+    # )
