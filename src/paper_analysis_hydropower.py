@@ -1256,7 +1256,9 @@ class NationalAnalysisHydropower:
             )
         ]["Capacity"].quantile(0.9)
 
-        self.gdf_switzerland.plot(ax=ax[0], color="white", edgecolor="black")
+        self.gdf_switzerland.plot(
+            ax=ax[0], color="white", edgecolor="black", rasterized=True
+        )
         self.gdf_hydropower_locations[
             (
                 self.gdf_hydropower_locations["WASTANumber"].isin(
@@ -1265,7 +1267,14 @@ class NationalAnalysisHydropower:
             )
             & (self.gdf_hydropower_locations["Capacity"] < capacity_upper_10)
             & (~pd.isna(self.gdf_hydropower_locations["Canton"]))
-        ].plot(ax=ax[0], legend=False, color=blue, marker=".", markersize=4)
+        ].plot(
+            ax=ax[0],
+            legend=False,
+            color=blue,
+            marker=".",
+            markersize=4,
+            rasterized=True,
+        )
         self.gdf_hydropower_locations[
             (
                 self.gdf_hydropower_locations["WASTANumber"].isin(
@@ -1274,7 +1283,14 @@ class NationalAnalysisHydropower:
             )
             & (self.gdf_hydropower_locations["Capacity"] >= capacity_upper_10)
             & (~pd.isna(self.gdf_hydropower_locations["Canton"]))
-        ].plot(ax=ax[0], legend=False, color=red, marker=".", markersize=20)
+        ].plot(
+            ax=ax[0],
+            legend=False,
+            color=red,
+            marker=".",
+            markersize=20,
+            rasterized=True,
+        )
 
         ax[0].axis("off")
         ax[0].set_title(
@@ -1326,6 +1342,7 @@ class NationalAnalysisHydropower:
             output_path.mkdir(exist_ok=True, parents=True)
             plt.savefig(
                 output_path / output_filename,
+                format="eps",
                 dpi=300,
                 bbox_inches="tight",
             )
@@ -1413,9 +1430,10 @@ class NationalAnalysisHydropower:
             label="Estimated Generation",
             legend=False,
             color=blue,
+            rasterized=True,
         )
         df_hydropower_yearly.plot(
-            y="Reported Generation", ax=ax[0], legend=False, color=red
+            y="Reported Generation", ax=ax[0], legend=False, color=red, rasterized=True
         )
         ax[0].set_ylim(min_val - 1.0, max_val + 1.0)
         if subplots_titles:
@@ -1432,6 +1450,7 @@ class NationalAnalysisHydropower:
             label="Estimated Generation",
             legend=False,
             color=blue,
+            rasterized=True,
         )
         df_hydropower_seasonal.plot(
             y="Reported Generation Winter",
@@ -1439,6 +1458,7 @@ class NationalAnalysisHydropower:
             label="Reported Generation",
             legend=False,
             color=red,
+            rasterized=True,
         )
         ax[1].set_ylim(min_val_winter - 1.0, max_val_winter + 1.0)
         ax[1].set_yticks(np.arange(3, 10, 2))
@@ -1455,6 +1475,7 @@ class NationalAnalysisHydropower:
             label="Estimated Generation",
             color=blue,
             legend=False,
+            rasterized=True,
         )
         df_hydropower_seasonal.plot(
             y="Reported Generation Summer",
@@ -1462,6 +1483,7 @@ class NationalAnalysisHydropower:
             label="Reported Generation",
             color=red,
             legend=False,
+            rasterized=True,
         )
         ax[2].set_ylim(min_val_summer - 1.0, max_val_summer + 1.0)
         if subplots_titles:
@@ -1580,6 +1602,7 @@ class NationalAnalysisHydropower:
             label="Estimated Generation",
             legend=False,
             color=blue,
+            rasterized=True,
         )
         df_hydropower_yearly.plot(
             y=yearly_column_to_plot + "_fixed_system_2022",
@@ -1587,6 +1610,7 @@ class NationalAnalysisHydropower:
             legend=False,
             color=green,
             alpha=0.8,
+            rasterized=True,
         )
 
         df_hydropower_yearly.plot(
@@ -1595,6 +1619,7 @@ class NationalAnalysisHydropower:
             legend=False,
             color=orange,
             alpha=0.8,
+            rasterized=True,
         )
         ax[0].set_ylabel("Generation (in TWh)", fontsize=FONTSIZE_LABELS)
         ax[0].set_ylim(min_val - 1.0, max_val + 1.0)
@@ -1614,6 +1639,7 @@ class NationalAnalysisHydropower:
             label="Estimated Generation",
             legend=False,
             color=blue,
+            rasterized=True,
         )
 
         df_hydropower_seasonal.plot(
@@ -1622,6 +1648,7 @@ class NationalAnalysisHydropower:
             legend=False,
             color=green,
             alpha=0.8,
+            rasterized=True,
         )
 
         df_hydropower_seasonal.plot(
@@ -1630,6 +1657,7 @@ class NationalAnalysisHydropower:
             legend=False,
             color=orange,
             alpha=0.8,
+            rasterized=True,
         )
 
         subplot_title = (
@@ -1652,6 +1680,7 @@ class NationalAnalysisHydropower:
             label="Estimated Generation (evolving capacities)",
             color=blue,
             legend=False,
+            rasterized=True,
         )
 
         df_hydropower_seasonal.plot(
@@ -1661,6 +1690,7 @@ class NationalAnalysisHydropower:
             legend=False,
             color=green,
             alpha=0.8,
+            rasterized=True,
         )
 
         df_hydropower_seasonal.plot(
@@ -1670,6 +1700,7 @@ class NationalAnalysisHydropower:
             legend=False,
             color=orange,
             alpha=0.8,
+            rasterized=True,
         )
 
         subplot_title = (
@@ -2052,6 +2083,7 @@ class NationalAnalysisHydropower:
             output_path.mkdir(exist_ok=True, parents=True)
             plt.savefig(
                 output_path / output_filename,
+                format="eps",
                 dpi=300,
                 bbox_inches="tight",
             )
@@ -2059,9 +2091,7 @@ class NationalAnalysisHydropower:
         plt.show()
 
     def compute_hydropower_generation_trend_slopes(
-        self,
-        df_hydropower_generation: pd.DataFrame,
-        round_results: bool = True
+        self, df_hydropower_generation: pd.DataFrame, round_results: bool = True
     ) -> pd.DataFrame:
         """Computes the trend slopes for the estimated generation
         along with their confidence intervals. It could be on a monthly
@@ -2089,8 +2119,9 @@ class NationalAnalysisHydropower:
 
         for i in df_hydropower_generation.index:
             y = df_hydropower_generation.loc[i].values
-            coef, _, _, conf_interval = self.compute_trend_statsmodel(X, y,
-                                                                      round_results=round_results)
+            coef, _, _, conf_interval = self.compute_trend_statsmodel(
+                X, y, round_results=round_results
+            )
             coeffs.append(
                 {
                     "name": i,
@@ -2155,7 +2186,12 @@ class NationalAnalysisHydropower:
         if save and output_filename:
             output_path = self.path_figs
             output_path.mkdir(exist_ok=True, parents=True)
-            plt.savefig(output_path / output_filename, dpi=300, bbox_inches="tight")
+            plt.savefig(
+                output_path / output_filename,
+                format="eps",
+                dpi=300,
+                bbox_inches="tight",
+            )
 
         plt.show()
 
@@ -2194,8 +2230,7 @@ class NationalAnalysisHydropower:
             )
         )
         winter_coeffs_per_hp = self.compute_hydropower_generation_trend_slopes(
-            df_hydropower_generation_per_hp_winter,
-            round_results=False
+            df_hydropower_generation_per_hp_winter, round_results=False
         )
 
         winter_coeffs_per_hp["winter_mean"] = (
@@ -2253,10 +2288,7 @@ class NationalAnalysisHydropower:
         fig, ax = plt.subplots(1, 2, figsize=(15 * cm, 7 * cm), width_ratios=(2, 1))
 
         self.gdf_switzerland.plot(
-            ax=ax[0],
-            color="white",
-            edgecolor="black",
-            linewidth=0.5,
+            ax=ax[0], color="white", edgecolor="black", linewidth=0.5, rasterized=True
         )
 
         gdf_hydropower_coef_map[
@@ -2268,6 +2300,7 @@ class NationalAnalysisHydropower:
             marker=".",
             s=4,
             cmap=cmap,
+            rasterized=True,
         )
 
         gdf_hydropower_coef_map[
@@ -2281,10 +2314,13 @@ class NationalAnalysisHydropower:
             edgecolor="black",
             linewidth=1,
             cmap=cmap,
+            rasterized=True,
         )
         ax[0].axis("off")
         ax[0].tick_params(left=False, labelleft=False, bottom=False, labelbottom=False)
-        ax[0].set_title("a", fontweight="bold", loc="left", fontsize=FONTSIZE_TITLE, y=1)
+        ax[0].set_title(
+            "a", fontweight="bold", loc="left", fontsize=FONTSIZE_TITLE, y=1
+        )
 
         df_frequency_categories = (
             gdf_hydropower_coef_map.groupby(
@@ -2294,7 +2330,7 @@ class NationalAnalysisHydropower:
             .unstack(fill_value=0)
         )
         df_frequency_categories.plot.bar(
-            ax=ax[1], stacked=True, legend=False, color=colors
+            ax=ax[1], stacked=True, legend=False, color=colors, rasterized=True
         )
 
         ax[1].set_xticks(
@@ -2302,7 +2338,9 @@ class NationalAnalysisHydropower:
         )
         ax[1].set_xlabel("Quantiles of capacity", fontsize=FONTSIZE_LABELS)
         ax[1].set_ylabel("Frequency", fontsize=7)
-        ax[1].set_title("b", fontweight="bold", loc="left", fontsize=FONTSIZE_TITLE, x=-0.24, y=1)
+        ax[1].set_title(
+            "b", fontweight="bold", loc="left", fontsize=FONTSIZE_TITLE, x=-0.24, y=1
+        )
 
         plt.tight_layout()
         plt.subplots_adjust(wspace=0, hspace=0)
@@ -2336,7 +2374,7 @@ class NationalAnalysisHydropower:
             fontsize=7,
             title="Decadal relative change (%)",
             title_fontsize=FONTSIZE_LABELS,
-            frameon=False
+            frameon=False,
         )
         ax[1].tick_params(axis="both", which="major", labelsize=FONTSIZE_TICKS)
         ax[1].tick_params(axis="both", which="minor", labelsize=FONTSIZE_TICKS)
@@ -2344,7 +2382,12 @@ class NationalAnalysisHydropower:
         if save and output_filename:
             output_path = self.path_figs
             output_path.mkdir(exist_ok=True, parents=True)
-            plt.savefig(output_path / output_filename, dpi=300, bbox_inches="tight")
+            plt.savefig(
+                output_path / output_filename,
+                format="eps",
+                dpi=300,
+                bbox_inches="tight",
+            )
 
         plt.show()
 
@@ -2398,10 +2441,7 @@ class NationalAnalysisHydropower:
 
             wasta = (
                 self.gdf_hydropower_locations[
-                    (
-                        self.gdf_hydropower_locations["BeginningOfOperation"]
-                        <= year
-                    )
+                    (self.gdf_hydropower_locations["BeginningOfOperation"] <= year)
                     & (
                         self.gdf_hydropower_locations["WASTANumber"].isin(
                             self.ds_hydropower_generation.hydropower.to_numpy()
@@ -2444,6 +2484,7 @@ class NationalAnalysisHydropower:
                 color="white",
                 edgecolor="black",
                 linewidth=0.5,
+                rasterized=True,
             )
 
             gdf_hydropower_quantile_map[
@@ -2455,6 +2496,7 @@ class NationalAnalysisHydropower:
                 marker=".",
                 s=0.8,
                 cmap=cmap,
+                rasterized=True,
             )
 
             gdf_hydropower_quantile_map[
@@ -2468,6 +2510,7 @@ class NationalAnalysisHydropower:
                 edgecolor="black",
                 linewidth=0.6,
                 cmap=cmap,
+                rasterized=True,
             )
 
             axs[row, col].set_title(year, fontsize=6, loc="left", y=0.7)
@@ -2521,7 +2564,12 @@ class NationalAnalysisHydropower:
         if save and output_filename:
             output_path = self.path_figs
             output_path.mkdir(exist_ok=True, parents=True)
-            plt.savefig(output_path / output_filename, dpi=200, bbox_inches="tight")
+            plt.savefig(
+                output_path / output_filename,
+                format="eps",
+                dpi=200,
+                bbox_inches="tight",
+            )
 
         plt.show()
 
@@ -2536,14 +2584,15 @@ class NationalAnalysisHydropower:
         output_filename: str = None,
     ):
         df_quantiles = self.create_dataframe_with_quantiles(yearly, variable_name)
-        df_quantiles["quantile_threshold"] = df_quantiles["quantile"].apply(lambda q: q >= quantile_threshold if higher_than else q <= quantile_threshold)
+        df_quantiles["quantile_threshold"] = df_quantiles["quantile"].apply(
+            lambda q: q >= quantile_threshold
+            if higher_than
+            else q <= quantile_threshold
+        )
         for year in df_quantiles.index.get_level_values(level=0).unique():
             wasta = (
                 self.gdf_hydropower_locations[
-                    (
-                        self.gdf_hydropower_locations["BeginningOfOperation"]
-                        <= year
-                    )
+                    (self.gdf_hydropower_locations["BeginningOfOperation"] <= year)
                     & (
                         self.gdf_hydropower_locations["WASTANumber"].isin(
                             self.ds_hydropower_generation.hydropower.to_numpy()
@@ -2555,22 +2604,33 @@ class NationalAnalysisHydropower:
             )
             df_quantiles.loc[(year, wasta), "quantile_threshold"] = False
 
-        df_quantiles_threshold_per_year = df_quantiles.groupby("time").sum("quantile_threshold")[["quantile_threshold"]]
-        df_quantiles_threshold_per_year = df_quantiles_threshold_per_year.groupby((df_quantiles_threshold_per_year.index//10)*10).sum()
+        df_quantiles_threshold_per_year = df_quantiles.groupby("time").sum(
+            "quantile_threshold"
+        )[["quantile_threshold"]]
+        df_quantiles_threshold_per_year = df_quantiles_threshold_per_year.groupby(
+            (df_quantiles_threshold_per_year.index // 10) * 10
+        ).sum()
 
-        _, ax = plt.subplots(figsize=(7.5*cm, 6*cm))
-        df_quantiles_threshold_per_year.plot.bar(ax=ax, color=blue, legend=False)
+        _, ax = plt.subplots(figsize=(7.5 * cm, 6 * cm))
+        df_quantiles_threshold_per_year.plot.bar(
+            ax=ax, color=blue, legend=False, rasterized=True
+        )
         ax.set_xlabel("")
         ax.set_ylabel("Number of hydropower plants", fontsize=FONTSIZE_LABELS)
 
         ax.tick_params(axis="both", which="major", labelsize=FONTSIZE_TICKS)
         ax.tick_params(axis="both", which="minor", labelsize=FONTSIZE_TICKS)
-        plt.xticks(rotation=45)
+        plt.xticks(rotation=0)
 
         if save and output_filename:
             output_path = self.path_figs
             output_path.mkdir(exist_ok=True, parents=True)
-            plt.savefig(output_path / output_filename, dpi=300, bbox_inches="tight")
+            plt.savefig(
+                output_path / output_filename,
+                format="eps",
+                dpi=300,
+                bbox_inches="tight",
+            )
 
         plt.show()
 
@@ -2621,7 +2681,7 @@ def plot_pre_post_bias_correction_validation(
         yearly_column_to_plot=yearly_column_to_plot,
         winter_column_to_plot=winter_column_to_plot,
         summer_column_to_plot=summer_column_to_plot,
-        subplots_titles=subplots_titles
+        subplots_titles=subplots_titles,
     )
     axs[0, 0].text(
         x=-0.22,
@@ -2638,7 +2698,7 @@ def plot_pre_post_bias_correction_validation(
         yearly_column_to_plot=yearly_column_to_plot,
         winter_column_to_plot=winter_column_to_plot,
         summer_column_to_plot=summer_column_to_plot,
-        subplots_titles=subplots_titles
+        subplots_titles=subplots_titles,
     )
     axs[1, 0].text(
         x=-0.22,
@@ -2666,6 +2726,7 @@ def plot_pre_post_bias_correction_validation(
         output_path.mkdir(exist_ok=True, parents=True)
         plt.savefig(
             output_path / output_filename,
+            format="eps",
             dpi=300,
             bbox_inches="tight",
         )
