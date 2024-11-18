@@ -799,7 +799,7 @@ if __name__ == "__main__":
     data_processing = DataProcessing("paths.json")
     data_processing.convert_bin_to_netcdf_runoff_prevah()
     data_processing.extract_points_in_polygons()
-    data_processing.compute_accumulated_streamflow_per_polygon()
+    data_processing.compute_accumulated_streamflow_per_polygon(prefix="Mob500_RGS_")
     data_processing.get_catchment_area_per_hydropower()
     data_processing.compute_hydropower_production()
 

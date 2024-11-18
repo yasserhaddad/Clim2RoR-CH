@@ -57,6 +57,8 @@ class NationalAnalysisHydropower:
         df_hydropower_production_params: pd.DataFrame,
         df_hydropower_generation_historical: pd.DataFrame,
         path_figs: pathlib.Path,
+        ds_hydropower_generation_per_hp_yearly_ref: xr.Dataset = None,
+        ds_hydropower_generation_per_hp_seasonal_ref: xr.Dataset = None
     ):
         self.gdf_switzerland = gdf_switzerland
         self.gdf_hydropower_polygons = gdf_hydropower_polygons
@@ -139,8 +141,8 @@ class NationalAnalysisHydropower:
         self.ds_hydropower_generation_seasonal_with_operation_start = None
         self.ds_hydropower_generation_seasonal_with_first_year_infrastructure = None
 
-        self.ds_hydropower_generation_per_hp_yearly_ref = None
-        self.ds_hydropower_generation_per_hp_seasonal_ref = None
+        self.ds_hydropower_generation_per_hp_yearly_ref = ds_hydropower_generation_per_hp_yearly_ref
+        self.ds_hydropower_generation_per_hp_seasonal_ref = ds_hydropower_generation_per_hp_seasonal_ref
 
     @staticmethod
     def seasonal_months(years: np.ndarray) -> Dict[str, Dict[str, List[str]]]:
@@ -1288,7 +1290,7 @@ class NationalAnalysisHydropower:
         ].plot(
             ax=ax[0],
             legend=False,
-            color=red,
+            color=deep_orange,
             marker=".",
             markersize=20,
             rasterized=(file_format == "eps"),
@@ -1324,7 +1326,7 @@ class NationalAnalysisHydropower:
             [0],
             [0],
             color="white",
-            markerfacecolor=red,
+            markerfacecolor=deep_orange,
             marker=".",
             markeredgewidth=0,
             markeredgecolor="black",
@@ -2425,6 +2427,8 @@ class NationalAnalysisHydropower:
         self,
         yearly: bool,
         variable_name: str,
+        nb_plots_col: int = 10,
+        with_decade_visualization: bool = False,
         with_operation_start: bool = False,
         save: bool = False,
         output_filename: str = None,
@@ -2452,25 +2456,24 @@ class NationalAnalysisHydropower:
         colors = [colormap(i / num_bins) for i in range(num_bins)]
         cmap = ListedColormap(colors)
 
-        nb_plots_row = 10
         df_generation = self.create_dataframe_with_quantiles(yearly, variable_name)
 
         years = df_generation.index.get_level_values("time").unique()
         start_decade = int(np.floor(years[0] / 10.0) * 10)
-
+        nb_decades = len(np.unique([year - (year%10) for year in years]))
+        nb_plots_rows = nb_decades if with_decade_visualization else int(np.ceil(len(years) / nb_plots_col))
         fig, axs = plt.subplots(
-            nb_plots_row,
-            int(np.ceil(len(years) / nb_plots_row)),
-            figsize=(15 * cm, 20 * cm),
+            10 if with_decade_visualization else nb_plots_col,
+            nb_plots_rows,
+            figsize=(15 * cm, 20 * cm)
         )
 
-        for i in range(len(axs)):
-            for j in range(len(axs[i, :])):
-                axs[i, j].axis("off")
+        for ax in axs.flat:
+            ax.axis("off")
 
         for i, year in enumerate(years):
-            row = year % 10
-            col = (year - start_decade) // 10
+            row = year % 10 if with_decade_visualization else i % nb_plots_col
+            col = (year - start_decade) // 10 if with_decade_visualization else i // nb_plots_col
 
             wasta = (
                 self.gdf_hydropower_locations[
@@ -2672,7 +2675,7 @@ class NationalAnalysisHydropower:
             ax=ax, color=blue, legend=False, rasterized=(file_format=="eps")
         )
         ax.set_xlabel("")
-        ax.set_ylabel("Number of hydropower plants", fontsize=FONTSIZE_LABELS)
+        ax.set_ylabel("Number of occurences", fontsize=FONTSIZE_LABELS)
 
         ax.tick_params(axis="both", which="major", labelsize=FONTSIZE_TICKS)
         ax.tick_params(axis="both", which="minor", labelsize=FONTSIZE_TICKS)
