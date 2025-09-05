@@ -1,3 +1,5 @@
+import zarr
+
 ATTRIBUTES = {
     "RGS": {
         "product": "RGS",
@@ -24,6 +26,10 @@ ACCUM_HYDRO_NETCDF_ENCODINGS = {
     'fletcher32': False,
     'contiguous': False,
     'chunksizes': (30, 1000),
+}
+
+ACCUM_HYDRO_ZARR_ENCODING = {
+    "compressor": zarr.Blosc(cname="zstd", clevel=3, shuffle=zarr.Blosc.SHUFFLE),
 }
 
 HYDROPOWER_NETCDF_ENCODINGS = {

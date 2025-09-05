@@ -1,25 +1,17 @@
 import json
 import os
-os.environ["OMP_NUM_THREADS"] = "1"
-os.environ["MKL_NUM_THREADS"] = "1"
-os.environ["OPENBLAS_NUM_THREADS"] = "1"
-os.environ["NUMEXPR_NUM_THREADS"] = "1"
 
 import shutil
 import time
 from pathlib import Path
 
-import dask
-import calendar
 import numpy as np
 import pandas as pd
 import xarray as xr
 
-os.environ["USE_PYGEOS"] = "0"
 from itertools import repeat
 from multiprocessing import Pool
 
-import geopandas as gpd
 from src.extract_runoff_prevah import (
     batch_extraction_prevah,
 )
@@ -33,25 +25,45 @@ from src.utils_streamflow_hydropower import (
     WATER_DENSITY,
     compute_ds_hydropower_generation_from_streamflow,
     compute_simplified_efficiency_term,
-    compute_streamflow_aggregate_polygons_parallel,
+    aggregate_streamflow_with_mask,
     concat_list_ds_and_save,
     convert_mm_d_to_cubic_m_s,
-    get_beta_coeff,
+    build_hydropower_parameter_table,
+    compute_hydropower_production_vectorized,
 )
-from src.var_attributes import ACCUM_HYDRO_NETCDF_ENCODINGS
+from src.var_attributes import ACCUM_HYDRO_ZARR_ENCODING
+
+# Set environment variables after imports so import block remains contiguous
+os.environ["OMP_NUM_THREADS"] = "1"
+os.environ["MKL_NUM_THREADS"] = "1"
+os.environ["OPENBLAS_NUM_THREADS"] = "1"
+os.environ["NUMEXPR_NUM_THREADS"] = "1"
+os.environ["USE_PYGEOS"] = "0"
+
+import dask
+from dask.diagnostics import ProgressBar
+import geopandas as gpd
 
 DEFAULT_EFFICIENCY = 0.8
 
 
-class DataProcessing:
-    def __init__(self, paths_file: str):
+class DataProcessingDask:
+    def __init__(self, paths_file: str, climate_model_chain: str, climate_scenario: str):
         print("Loading data")
         paths = json.load(open(paths_file))
-        self.path_data = Path(paths["path_data"])
+        self.path_data_ror = Path(paths["path_data_ror"])
+        self.path_data_projections = Path(paths["path_data_projections"])
+        self.climate_model_chain = climate_model_chain
+        self.climate_scenario = climate_scenario
 
-        self.path_data_prevah = self.path_data / "prevah"
-        self.path_data_hydro = self.path_data / "hydropower"
-        self.path_data_polygons = self.path_data / "polygons"
+        self.path_data_prevah = (
+            self.path_data_projections
+            / "cordex_processed"
+            / f"{self.climate_model_chain}_{self.climate_scenario}"
+            / "prevah"
+        )
+        self.path_data_hydro = self.path_data_ror / "hydropower"
+        self.path_data_polygons = self.path_data_ror / "polygons"
 
         self.gdf_polygons = gpd.read_file(
             self.path_data_polygons / "EZG_Gewaesser.gpkg"
@@ -156,9 +168,9 @@ class DataProcessing:
         print("Extracting dataset grid points in polygons")
         time_start = time.time()
         # Load sample runoff data
-        ds_sample = xr.open_dataset(
-                list((self.path_data_prevah / "netcdf").glob("*.nc"))[0]
-            )
+        ds_sample = xr.open_zarr(
+            self.path_data_prevah / "rgs.zarr", chunks="auto"
+        )
 
         # Transform a sample runoff grid into a GeoDataFrame to use operations included in GeoPandas
         df_runoff = ds_sample.isel(time=0).to_dataframe().reset_index()
@@ -198,10 +210,71 @@ class DataProcessing:
 
         print(f"\tExtracted successfully all points in polygons! Time elapsed: {(time.time() - time_start)/60:.2f} minutes.")
 
+    def create_prevah_polygon_grid(
+        self,
+        df_prevah_pts_in_polygons_filename: str = "df_prevah_500_pts_in_polygons.csv",
+        fill_value: int = -1,
+    ) -> xr.DataArray:
+        """Create an xarray DataArray mapping each PREVAH grid cell (y,x) to the EZGNR polygon id.
+
+        The function:
+        - loads the points-in-polygons table (if not already loaded),
+        - pivots the table into a 2D array indexed by y (rows) and x (cols),
+        - aligns that 2D array to the full grid coordinates,
+        - returns an xarray.DataArray with dims ('y','x') where each cell contains the EZGNR
+          (or fill_value if the grid cell is not in any polygon).
+
+        Notes:
+        - If multiple polygon ids exist for the same grid cell, the first is kept.
+        """
+        # load points-in-polygons table if required
+        if self.df_prevah_pts_in_polygons is None:
+            self.df_prevah_pts_in_polygons = pd.read_csv(
+                self.path_data_polygons / df_prevah_pts_in_polygons_filename
+            )
+
+        df_pts = self.df_prevah_pts_in_polygons.copy()
+
+        # ensure columns exist and correct dtypes
+        if "x" not in df_pts.columns or "y" not in df_pts.columns or "EZGNR" not in df_pts.columns:
+            raise ValueError("df_prevah_pts_in_polygons must contain columns 'x', 'y' and 'EZGNR'")
+
+        # Derive grid coordinates directly from the points-in-polygons dataframe
+        x_coords = np.sort(df_pts["x"].unique())
+        y_coords = np.sort(df_pts["y"].unique())
+
+        # Pivot the dataframe to 2D: index=y, columns=x, values=EZGNR (keep first if duplicates)
+        df_pivot = (
+            df_pts[["y", "x", "EZGNR"]]
+            .dropna(subset=["x", "y", "EZGNR"])
+            # .astype({"x": float, "y": float})
+            .pivot_table(index="y", columns="x", values="EZGNR", aggfunc="first")
+        )
+
+        # Reindex pivot to match the full grid coordinates (this ensures correct ordering and fills missing)
+        df_pivot = df_pivot.reindex(index=y_coords, columns=x_coords)
+
+        # Convert to numpy and fill missing with fill_value
+        arr = df_pivot.to_numpy()  # flip y to match increasing y coord
+        arr = np.where(np.isnan(arr), fill_value, arr).astype(int)
+
+        # Create DataArray with same coordinate labels as the sample dataset
+        da = xr.DataArray(
+            arr,
+            dims=("y", "x"),
+            coords={"y": y_coords, "x": x_coords},
+            name="EZGNR",
+        )
+
+        # save to zarr for later quick loading
+        self.grid_pt_in_polygon = da
+
+        return da
+
     def compute_accumulated_streamflow_per_polygon(
         self,
         df_prevah_pts_in_polygons_filename: str = "df_prevah_500_pts_in_polygons.csv",
-        prefix: str = "Mob500_RGS_",
+        grid_fill_value: int = -1,
         streamflow_grid_resolution: float = 500,
         output_filename: str = "ds_prevah_500_streamflow_accum_per_polygon",
     ) -> None:
@@ -222,83 +295,77 @@ class DataProcessing:
             Name of output file (without extension) containing the xarray Dataset of accumulated
             streamflow at each polygon, by default "ds_prevah_500_streamflow_accum_per_polygon"
         """
+        time_start = time.time()
         relevant_polygons = self.gdf_polygons.EZGNR.to_numpy()
         if self.df_prevah_pts_in_polygons is None:
             self.df_prevah_pts_in_polygons = pd.read_csv(
                 self.path_data_polygons / df_prevah_pts_in_polygons_filename
             )
+        if self.grid_pt_in_polygon is None:
+            self.create_prevah_polygon_grid(
+                df_prevah_pts_in_polygons_filename=df_prevah_pts_in_polygons_filename,
+                fill_value=grid_fill_value
+            )
 
         # Converting streamflow to accumulated streamflow per polygon
         print("Computing accumulated streamflow")
-        list_ds_accum_streamflow = []
-
-        leap_years = []
-        time_start = time.time()
-        for path_rgs in list((self.path_data_prevah / "netcdf").glob("*")):
-            year = int(path_rgs.stem.split(prefix)[1])
-            if calendar.isleap(year):
-                leap_years.append(year)
-            ds_rgs = xr.open_dataset(path_rgs).apply(
-                lambda v: convert_mm_d_to_cubic_m_s(v, streamflow_grid_resolution**2)
+        ds_rgs = xr.open_zarr(self.path_data_prevah / "rgs.zarr", chunks="auto").apply(
+            lambda v: xr.apply_ufunc(
+                convert_mm_d_to_cubic_m_s,
+                v,
+                streamflow_grid_resolution**2,
+                vectorize=True,
+                dask="parallelized",
+                output_dtypes=[v.dtype],
             )
-            list_ds_accum_streamflow.append(
-                compute_streamflow_aggregate_polygons_parallel(
+        )
+        with ProgressBar(dt=10):
+            ds_accum = (
+                aggregate_streamflow_with_mask(
                     ds_rgs,
-                    self.gdf_polygons,
-                    self.df_prevah_pts_in_polygons,
-                    relevant_polygons,
+                    self.grid_pt_in_polygon,
+                    method="sum",
+                    fill_value=grid_fill_value,
+                    polygons=relevant_polygons,
                 )
             )
-            print(
-                f"\tYear: {year}, time elapsed: {(time.time() - time_start)/60:.2f} minutes.",
-                end="\r",
+
+            ds_accum = ds_accum.sel(time=~(ds_accum.time.dt.month == 2) & ~(ds_accum.time.dt.day == 29))
+            encoding = {
+                var: {
+                    "compressor": ACCUM_HYDRO_ZARR_ENCODING["compressor"],
+                    "chunks": {"time": 365, "polygon": 1000}
+                }
+                for var in list(ds_accum.data_vars.keys())
+            }
+            encoding["time"] = {
+                "units": f"seconds since {np.datetime_as_string(ds_accum.time[0].values)}"
+            }
+
+            output_filepath = self.path_data_prevah / f"{output_filename}.zarr"
+            ds_accum.to_zarr(output_filepath, mode="w", encoding=encoding)
+
+            new_end_time = ds_accum.time[-1] + np.timedelta64(23, "h")
+            ds_accum_hourly = ds_accum.reindex(
+                time=pd.date_range(
+                    start=ds_accum.time[0].values,
+                    end=new_end_time.values,
+                    freq="1H",
+                    inclusive="both",
+                ),
+                method="ffill",
             )
-
-        hours_to_remove = [
-            date
-            for year in leap_years
-            for date in pd.date_range(
-                start=f"{year}-02-29 00:00",
-                end=f"{year}-03-01 00:00",
-                freq="1H",
-                inclusive="left",
-            )
-        ]
-
-        dates_to_remove = [f"{year}-02-29" for year in leap_years]
-
-        ds_accum = xr.concat(list_ds_accum_streamflow, "time")
-        encoding = {
-            var: ACCUM_HYDRO_NETCDF_ENCODINGS.copy()
-            for var in list(ds_accum.data_vars.keys())
-        }
-        encoding["time"] = {
-            "units": f"seconds since {np.datetime_as_string(ds_accum.time[0].values)}"
-        }
-
-        output_filepath = self.path_data_prevah / f"{output_filename}.nc"
-        if output_filepath.is_file():
-            output_filepath.unlink()
-
-        ds_accum.drop_sel(time=dates_to_remove).to_netcdf(output_filepath, mode="w", encoding=encoding)
-
-        new_end_time = ds_accum.time[-1] + np.timedelta64(23, "h")
-        ds_accum_hourly = ds_accum.reindex(
-            time=pd.date_range(
-                start=ds_accum.time[0].values,
-                end=new_end_time.values,
-                freq="1H",
-                inclusive="both",
-            ),
-            method="ffill",
-        ).drop_sel(time=hours_to_remove)
-
-        output_filepath = self.path_data_prevah / f"{output_filename}_hourly.nc"
-        if output_filepath.is_file():
-            output_filepath.unlink()
-
-        ds_accum_hourly.to_netcdf(output_filepath, mode="w", encoding=encoding)
-        self.ds_accumulated_streamflow_polygon = ds_accum_hourly
+            ds_accum_hourly = ds_accum_hourly.sel(time=~(ds_accum_hourly.time.dt.month == 2) & ~(ds_accum_hourly.time.dt.day == 29))
+            encoding = {
+                var: {
+                    "compressor": ACCUM_HYDRO_ZARR_ENCODING["compressor"],
+                    "chunks": {"time": 8760, "polygon": 1000}
+                }
+                for var in list(ds_accum_hourly.data_vars.keys())
+            }
+            output_filepath = self.path_data_prevah / f"{output_filename}_hourly.zarr"
+            ds_accum_hourly.to_zarr(output_filepath, mode="w", encoding=encoding)
+            self.ds_accumulated_streamflow_polygon = ds_accum_hourly
 
         print(
             f"\tTotal time for accumulated streamflow: {(time.time() - time_start)/60:.2f} minutes."
@@ -417,8 +484,8 @@ class DataProcessing:
             along with the polygon of their manually assigned water intake point.
         """
         df_to_change = self.df_new_hydropower_polygons[
-            (self.df_new_hydropower_polygons["Checked"] == True)
-            & (self.df_new_hydropower_polygons["To change"] == True)
+            (self.df_new_hydropower_polygons["Checked"].astype(bool))
+            & (self.df_new_hydropower_polygons["To change"].astype(bool))
         ]
         df_to_change.loc[:, "New EZGNR"] = df_to_change.apply(
             lambda row: df_water_intake_polygons[
@@ -546,9 +613,34 @@ class DataProcessing:
         self.df_hydropower_polygons = df_hydropower_polygons
         print(f"Time elapsed: {(time.time() - time_start)/60:.2f} minutes.")
 
+    def build_polygon_plant_weights(
+            self,
+            polygons_all: np.ndarray,
+            hp_param_df: pd.DataFrame,
+            polygon_col='polygons_full',
+            dtype='uint8') -> xr.DataArray:
+        # polygons_all: sorted array of all polygon IDs in ds_accumulated_streamflow_polygon.polygon
+        poly_index = {pid: i for i, pid in enumerate(polygons_all)}
+        H = len(hp_param_df)
+        P = len(polygons_all)
+        weights = np.zeros((P, H), dtype=dtype)
+        for j, polys in enumerate(hp_param_df[polygon_col]):
+            for pid in polys:
+                i = poly_index.get(pid)
+                if i is not None:
+                    weights[i, j] = 1
+        return xr.DataArray(
+            weights,
+            dims=('polygon', 'hydropower'),
+            coords={'polygon': polygons_all, 'hydropower': hp_param_df['WASTANumber'].values},
+            name='weights'
+        )
+
+
+
     def compute_hydropower_production(
         self,
-        accumulated_streamflow_per_polygon_filename: str = "ds_prevah_500_streamflow_accum_per_polygon_hourly.nc",
+        accumulated_streamflow_per_polygon_filename: str = "ds_prevah_500_streamflow_accum_per_polygon_hourly.zarr",
         output_filename_prefix="ds_prevah_500_hydropower_production_ror",
     ) -> None:
         """Compute the hydropower production by converting the accumulated streamflow at the polygon assigned
@@ -558,7 +650,7 @@ class DataProcessing:
         ----------
         accumulated_streamflow_per_polygon_filename : str, optional
             Name of netcdf file containing the accumulated streamflow at each polygon
-            for every time step, by default "ds_prevah_500_streamflow_accum_per_polygon_hourly.nc"
+            for every time step, by default "ds_prevah_500_streamflow_accum_per_polygon_hourly.zarr"
         output_filename_prefix : str, optional
             Prefix to add to each filename of the outputs to save, by default
             "ds_prevah_500_hydropower_production_ror"
@@ -573,9 +665,9 @@ class DataProcessing:
             )
         # Load accumulated streamflow per polygon
         if self.ds_accumulated_streamflow_polygon is None:
-            self.ds_accumulated_streamflow_polygon = xr.open_dataset(
+            self.ds_accumulated_streamflow_polygon = xr.open_zarr(
                 self.path_data_prevah / accumulated_streamflow_per_polygon_filename
-            ).load()
+            )
 
         # --------------------------------------------------------------------------------------------------
         # Converting accumulated streamflow into hydropower generation
@@ -595,7 +687,6 @@ class DataProcessing:
         nb_hp = len(df_hydropower_to_process)
 
         list_ds = []
-        list_ds_with_beta = []
         list_parameters = []
 
         for idx, (_, hydropower_info) in enumerate(df_hydropower_to_process.iterrows()):
@@ -663,22 +754,6 @@ class DataProcessing:
                 installed_capacity=installed_capacity * 1e-6,
             )
 
-            beta_coeff = (
-                round(get_beta_coeff(ds, expected_generation * 1e-3), 2)
-                if expected_generation != 0
-                else 1
-            )
-            ds_beta = compute_ds_hydropower_generation_from_streamflow(
-                self.ds_accumulated_streamflow_polygon,
-                hydropower_info["WASTANumber"],
-                relevant_polygons,
-                hydraulic_head,
-                DEFAULT_EFFICIENCY,
-                simplified_efficiency=F * beta_coeff,
-                design_discharge=design_discharge,
-                installed_capacity=installed_capacity * 1e-6,  # to TW
-            )
-
             list_parameters.append(
                 {
                     "WASTANumber": hydropower_info["WASTANumber"],
@@ -691,12 +766,10 @@ class DataProcessing:
                     "Expected summer generation": expected_summer_generation,
                     "Percentage share CH": relevant_stats_row["Proz. Anteil CH"].item(),
                     "F": F,
-                    "beta_coeff": beta_coeff,
                 }
             )
             list_ds.append(ds)
-            list_ds_with_beta.append(ds_beta)
-            del ds, ds_beta
+            del ds
             print(
                 f"\t{idx+1}/{nb_hp}, elapsed_time: {(time.time() - time_start)/60:.2f} minutes.",
                 end="\r",
@@ -704,15 +777,9 @@ class DataProcessing:
 
         output_filepath = (
             self.path_data_hydro / "hydropower_generation"
-            / f"{output_filename_prefix}.nc"
+            / f"{output_filename_prefix}.zarr"
         )
         concat_list_ds_and_save(list_ds, output_filepath)
-
-        output_filepath = (
-            self.path_data_hydro / "hydropower_generation"
-            / f"{output_filename_prefix}_with_beta.nc"
-        )
-        concat_list_ds_and_save(list_ds_with_beta, output_filepath)
 
         pd.DataFrame(list_parameters).to_csv(
             self.path_data_hydro / "hydropower_generation" / f"{output_filename_prefix}_parameters.csv",
@@ -720,6 +787,80 @@ class DataProcessing:
         )
 
         print(f"\n\tTime elapsed: {(time.time() - time_start)/60:.2f} minutes.")
+
+    def compute_hydropower_production_vectorized(
+        self,
+        accumulated_streamflow_per_polygon_filename: str = "ds_prevah_500_streamflow_accum_per_polygon_hourly.zarr",
+        output_filename_prefix: str = "ds_prevah_500_hydropower_production_ror_vectorized",
+        allowed_types: list[str] | None = None,
+        timestep_hours: int = 1,
+        use_sparse: bool = False,
+    ) -> None:
+        """Vectorized hydropower production using polygon->plant weight matrix and xr.dot.
+
+        Parameters
+        ----------
+        accumulated_streamflow_per_polygon_filename : str
+            Zarr dataset with accumulated polygon streamflow (hourly or daily).
+        output_filename_prefix : str
+            Prefix for output Zarr store.
+        allowed_types : list[str] | None
+            Restrict to these plant types (e.g. ["L"]). If None, use all.
+        timestep_hours : int
+            Length of timestep (1 for hourly, 24 for daily input).
+        use_sparse : bool
+            Use sparse incidence matrix if True (for very large polygon x plant matrix).
+        """
+        print("Vectorized hydropower production (start)")
+        t0 = time.time()
+
+        # Load hydropower polygons metadata
+        if self.df_hydropower_polygons is None:
+            self.df_hydropower_polygons = pd.read_json(
+                self.path_data_hydro / "hydropower_polygons" / "df_hydropower_polygons.json",
+                orient="records",
+            )
+
+        # Load polygon streamflow dataset (accumulated)
+        if self.ds_accumulated_streamflow_polygon is None:
+            self.ds_accumulated_streamflow_polygon = xr.open_zarr(
+                self.path_data_prevah / accumulated_streamflow_per_polygon_filename
+            )
+
+        # Build parameter table (Step 1)
+        hp_params_df = build_hydropower_parameter_table(
+            self.df_stats_hydropower_ch,
+            self.df_hydropower_polygons,
+            allowed_types=allowed_types,
+        )
+        if hp_params_df.empty:
+            print("No hydropower plants found after filtering; aborting.")
+            return
+
+        # Vectorized compute (Steps 2-5)
+        output_dir = self.path_data_hydro / "hydropower_generation"
+        output_dir.mkdir(parents=True, exist_ok=True)
+        output_path = output_dir / f"{output_filename_prefix}.zarr"
+
+        ds_vec = compute_hydropower_production_vectorized(
+            self.ds_accumulated_streamflow_polygon,
+            hp_params_df,
+            variable="rgs",
+            timestep_hours=timestep_hours,
+            weights_sparse=use_sparse,
+            output_path=output_path,
+        )
+
+        # Save parameter table for reference
+        hp_params_df.to_csv(
+            output_dir / f"{output_filename_prefix}_parameters.csv",
+            index=False,
+        )
+
+        # Basic reporting
+        print(
+            f"Vectorized hydropower production saved: {output_path} | time elapsed: {(time.time() - t0)/60:.2f} min | plants: {ds_vec.dims.get('hydropower', 0)}"
+        )
 
     def compute_monthly_bias_correction_factors(
         self,
@@ -802,6 +943,7 @@ class DataProcessing:
 
 
 if __name__ == "__main__":
+    # Example execution block (adjust workers as appropriate for cluster/local machine)
     dask.config.set(num_workers=15, threads_per_worker=16)
     dask.config.set({
         "distributed.worker.memory.target": 0.7,  # Spill to disk at 70%
@@ -812,21 +954,38 @@ if __name__ == "__main__":
     })
 
 
-    data_processing = DataProcessing("paths.json")
-    # data_processing.convert_bin_to_netcdf_runoff_prevah()
-    data_processing.extract_points_in_polygons()
-    data_processing.compute_accumulated_streamflow_per_polygon(prefix="Mob500_RGS_")
-    data_processing.get_catchment_area_per_hydropower()
-    data_processing.compute_hydropower_production(
-        output_filename_prefix="ds_prevah_500_hydropower_production_ror"
-    )
+    data_processing = DataProcessingDask("paths.json")
 
-    hydropower_generation_dataset_filename = (
-        "ds_prevah_500_hydropower_production_ror.nc"
-    )
-    monthly_bias_correction_factors_filename = (
-        "ds_prevah_500_hydropower_production_ror_monthly_bias_correction_factors.nc"
-    )
-    data_processing.compute_monthly_bias_correction_factors(
-        hydropower_generation_dataset_filename, monthly_bias_correction_factors_filename
+    # --- Legacy pipeline (per-plant loops). Uncomment if still needed for comparison ---
+    data_processing.extract_points_in_polygons()
+    data_processing.compute_accumulated_streamflow_per_polygon()
+    data_processing.get_catchment_area_per_hydropower()
+    # data_processing.compute_hydropower_production(
+    #     output_filename_prefix="ds_prevah_500_hydropower_production_ror"
+    # )
+    # hydropower_generation_dataset_filename = (
+    #     "ds_prevah_500_hydropower_production_ror.nc"
+    # )
+    # monthly_bias_correction_factors_filename = (
+    #     "ds_prevah_500_hydropower_production_ror_monthly_bias_correction_factors.nc"
+    # )
+    # data_processing.compute_monthly_bias_correction_factors(
+    #     hydropower_generation_dataset_filename,
+    #     monthly_bias_correction_factors_filename,
+    # )
+
+    # --- Vectorized hydropower production pipeline (preferred) ---
+    # Requires precomputed polygon streamflow aggregated dataset (e.g., produced by mask aggregation)
+    # Example placeholder paths; update to actual locations in your environment.
+    data_processing.compute_hydropower_production_vectorized(
+        streamflow_polygon_zarr=str(
+            data_processing.path_data_hydro / "streamflow_polygons.zarr"
+        ),
+        hydropower_params_output=str(
+            data_processing.path_data_hydro / "hydropower_params.parquet"
+        ),
+        hydropower_generation_output=str(
+            data_processing.path_data_hydro / "hydropower_generation_vectorized.zarr"
+        ),
+        use_sparse=False,
     )

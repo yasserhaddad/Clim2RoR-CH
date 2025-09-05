@@ -181,7 +181,7 @@ def compute_streamflow_aggregate_hydropower(ds_streamflow: xr.Dataset, df_hydrop
         raise ValueError("The method should either be 'mean' or 'sum'.")
 
     relevant_row = df_hydropower_polygons.loc[df_hydropower_polygons["WASTANumber"] == hydropower_wasta]
-    upstream_polygons = relevant_row["upstream_EZGNR"].apply(lambda l: [] if pd.isnull(l) else literal_eval(l)).iloc[0]
+    upstream_polygons = relevant_row["upstream_EZGNR"].apply(lambda lst: [] if pd.isnull(lst) else literal_eval(lst)).iloc[0]
     relevant_polygons = (relevant_row["EZGNR"].to_list() + upstream_polygons)
 
     list_ds_polygons = []
@@ -432,3 +432,514 @@ def compute_streamflow_aggregate_polygons_parallel(
 
     return xr.concat(list_ds, "polygon").sortby("polygon")
 
+def aggregate_streamflow_with_mask(
+    ds_streamflow: xr.Dataset,
+    mask_da: xr.DataArray,
+    method: str = "sum",
+    fill_value: int = -1,
+    polygons: list[int] | None = None,
+    compute_counts: bool = False,
+    rechunk: dict | None = None,
+) -> xr.Dataset | tuple[xr.Dataset, xr.DataArray]:
+    """
+    Aggregate gridded streamflow to polygons using a precomputed (y,x) -> EZGNR mask.
+
+    Parameters
+    ----------
+    ds_streamflow : xr.Dataset
+        Dataset with dims including ('time','y','x'). Variables are aggregated.
+    mask_da : xr.DataArray
+        2D mask (y,x) with polygon ids (EZGNR) and a fill_value for non-polygon cells.
+    method : {'sum','mean'}
+        Aggregation method.
+    fill_value : int
+        Value in mask indicating "no polygon".
+    polygons : list[int] | None
+        Optional subset of polygon ids to keep (after aggregation).
+    compute_counts : bool
+        If True, also return DataArray of cell counts per polygon.
+    rechunk : dict | None
+        Optional rechunking (e.g. {'time': 8760, 'y': 400, 'x': 400}) before aggregation.
+
+    Returns
+    -------
+    xr.Dataset  (or (xr.Dataset, xr.DataArray) if compute_counts)
+    """
+    if method not in ("sum", "mean"):
+        raise ValueError("method must be 'sum' or 'mean'.")
+
+    # Optional rechunk to balance tasks; ensure y/x chunks not too tiny
+    if rechunk:
+        ds_streamflow = ds_streamflow.chunk({k: v for k, v in rechunk.items() if k in ds_streamflow.dims})
+
+    # Ensure mask aligns (broadcast if needed)
+    if not {"y", "x"}.issubset(mask_da.dims):
+        raise ValueError("mask_da must have dims ('y','x').")
+    # Align coordinates (no data load)
+    mask_da = mask_da.sel(
+        y=ds_streamflow.y, x=ds_streamflow.x
+    )
+
+    # Mask out non-polygon cells
+    valid_mask = mask_da != fill_value
+    masked_streamflow = ds_streamflow.where(valid_mask)
+
+    # groupby on the mask (xarray allows DataArray of same shape)
+    grouped = masked_streamflow.groupby(mask_da.where(valid_mask))
+
+    # Sum over spatial dims (y,x) only; keep time (and other non-spatial dims)
+    summed = grouped.sum(dim=("y", "x"))
+
+    # mask_da values become the dimension name of groupby result; rename cleanly
+    poly_dim_name = mask_da.name or "EZGNR"
+    if poly_dim_name in summed.dims:
+        summed = summed.rename({poly_dim_name: "polygon"})
+
+    # Optional subset
+    if polygons is not None:
+        summed = summed.sel(polygon=[p for p in polygons if p in summed.polygon.values])
+
+    if method == "mean":
+        # Compute counts lazily (cells per polygon)
+        ones = xr.ones_like(mask_da.where(valid_mask), dtype="int32")
+        counts = ones.groupby(mask_da.where(valid_mask)).sum(dim=("y", "x"))
+        if counts.name is None:
+            counts.name = "cell_count"
+        counts = counts.rename({counts.dims[0]: "polygon"})
+        if polygons is not None:
+            counts = counts.sel(polygon=[p for p in polygons if p in counts.polygon.values])
+        # Divide each variable by counts (auto aligns on 'polygon')
+        for v in summed.data_vars:
+            summed[v] = summed[v] / counts
+    else:
+        if compute_counts:
+            ones = xr.ones_like(mask_da.where(valid_mask), dtype="int32")
+            counts = ones.groupby(mask_da.where(valid_mask)).sum(dim=("y", "x"))
+            counts = counts.rename({counts.dims[0]: "polygon"})
+            if polygons is not None:
+                counts = counts.sel(polygon=[p for p in polygons if p in counts.polygon.values])
+            return summed.sortby("polygon"), counts.sortby("polygon")
+
+    if compute_counts and method == "mean":
+        return summed.sortby("polygon"), counts.sortby("polygon")
+    return summed.sortby("polygon")
+
+
+def build_hydropower_parameter_table(
+    df_stats_hydropower: pd.DataFrame,
+    df_hydropower_polygons: pd.DataFrame,
+    gross_head_cols: list[str] | None = None,
+    allowed_types: list[str] | None = None,
+    default_efficiency: float = 0.8,
+    gravity: float = GRAVITY,
+    water_density: float = WATER_DENSITY,
+    capacity_col: str = "Max. Leistung ab Generator",
+    design_discharge_col: str = "QTurbine [m3/sec]",
+    turbined_flag_col: str = "Funktion: Turbinieren",
+    yearly_generation_col: str = "Prod. ohne Umwälzbetrieb - J.",
+    summer_generation_col: str = "Prod. ohne Umwälzbetrieb - S.",
+    winter_generation_col: str = "Prod. ohne Umwälzbetrieb - W.",
+    percentage_share_col: str = "Proz. Anteil CH",
+    wasta_col_stats: str = "ZE-Nr",
+    wasta_col_polygons: str = "WASTANumber",
+) -> pd.DataFrame:
+    """Create per-plant parameter table for vectorized hydropower generation.
+
+    Returns a tidy DataFrame with one row per hydropower plant containing:
+      WASTANumber, polygons_full, installed_capacity_MW, design_discharge,
+      hydraulic_head, simplified_efficiency_F, expected_* generation metrics,
+      percentage_share_CH, Type (if present), and operation dates (if present).
+    """
+    if gross_head_cols is None:
+        gross_head_cols = [
+            "Maxim. Bruttofallhöhe [m]",
+            "Minim. Bruttofallhöhe [m]",
+            "Maxim. Nettofallhöhe [m]",
+        ]
+
+    stats = df_stats_hydropower.copy()
+    polys = df_hydropower_polygons.copy()
+
+    # Merge polygon + stats
+    merge_cols = [c for c in [wasta_col_stats, capacity_col, design_discharge_col, turbined_flag_col,
+                              yearly_generation_col, summer_generation_col, winter_generation_col,
+                              percentage_share_col] if c in stats.columns]
+    head_cols_present = [c for c in gross_head_cols if c in stats.columns]
+    opt_cols = [c for c in ("ZE-Name", "ZE-Erste Inbetriebnahme", "ZE-Letzte Inbetriebnahme", "Type") if c in stats.columns]
+
+    merged = polys.merge(
+        stats[merge_cols + head_cols_present + opt_cols],
+        left_on=wasta_col_polygons,
+        right_on=wasta_col_stats,
+        how="left",
+    )
+
+    if allowed_types is not None and "Type" in merged.columns:
+        merged = merged[merged["Type"].isin(allowed_types)]
+
+    def _combine_polygons(row):
+        base = row.get("EZGNR", [])
+        up = row.get("upstream_EZGNR", [])
+        if not isinstance(base, list):
+            base = [base]
+        if not isinstance(up, list):
+            up = [up] if up else []
+        # preserve order, remove duplicates
+        seen = {}
+        for p in base + up:
+            seen[p] = True
+        return list(seen.keys())
+
+    merged["polygons_full"] = merged.apply(_combine_polygons, axis=1)
+
+    def _infer_head(row):
+        for col in gross_head_cols:
+            if col in row and pd.notnull(row[col]) and row[col] > 0:
+                return float(row[col])
+        cap = row.get(capacity_col, np.nan)
+        qd = row.get(design_discharge_col, np.nan)
+        if pd.notnull(cap) and pd.notnull(qd) and qd > 0:
+            try:
+                return (cap * 1e6) / (qd * gravity * water_density * default_efficiency)
+            except Exception:  # noqa: BLE001
+                return np.nan
+        return np.nan
+
+    merged["hydraulic_head"] = merged.apply(_infer_head, axis=1)
+
+    def _compute_F(row):
+        cap = row.get(capacity_col, np.nan)
+        qd = row.get(design_discharge_col, np.nan)
+        hh = row.get("hydraulic_head", np.nan)
+        if pd.notnull(cap) and pd.notnull(qd) and pd.notnull(hh) and qd > 0 and hh > 0:
+            return (cap * 1e6) / (qd * hh)
+        return np.nan
+
+    merged["simplified_efficiency_F"] = merged.apply(_compute_F, axis=1)
+
+    valid = (
+        merged[design_discharge_col].notnull() & (merged[design_discharge_col] > 0) &
+        merged[capacity_col].notnull() & (merged[capacity_col] > 0) &
+        merged["hydraulic_head"].notnull() & (merged["hydraulic_head"] > 0)
+    )
+    merged = merged[valid].copy()
+
+    rename_map = {
+        capacity_col: "installed_capacity_MW",
+        design_discharge_col: "design_discharge",
+        yearly_generation_col: "expected_yearly_generation",
+        summer_generation_col: "expected_summer_generation",
+        winter_generation_col: "expected_winter_generation",
+        percentage_share_col: "percentage_share_CH",
+    }
+
+    selected_cols = [wasta_col_polygons, "polygons_full", "hydraulic_head", "simplified_efficiency_F"] + list(rename_map.keys())
+    for c in ("Type", "ZE-Name", "ZE-Erste Inbetriebnahme", "ZE-Letzte Inbetriebnahme"):
+        if c in merged.columns:
+            selected_cols.append(c)
+
+    param_df = merged[selected_cols].rename(columns=rename_map)
+    # Rename date columns if present
+    date_map = {"ZE-Erste Inbetriebnahme": "BeginningOfOperation", "ZE-Letzte Inbetriebnahme": "EndOfOperation"}
+    for k, v in date_map.items():
+        if k in param_df.columns:
+            param_df = param_df.rename(columns={k: v})
+
+    param_df = param_df.rename(columns={wasta_col_polygons: "WASTANumber"}).sort_values("WASTANumber").reset_index(drop=True)
+    return param_df
+
+
+# --------------------------------------------------------------------------------------
+# Vectorized hydropower production pipeline (Steps 2–5)
+# --------------------------------------------------------------------------------------
+def build_polygon_plant_weights(
+    polygons_all: np.ndarray,
+    hp_param_df: pd.DataFrame,
+    polygon_list_col: str = "polygons_full",
+    plant_id_col: str = "WASTANumber",
+    dtype: str | np.dtype = "uint8",
+) -> xr.DataArray:
+    """Build a dense (polygon x hydropower) weight matrix (0/1) as DataArray.
+
+    Parameters
+    ----------
+    polygons_all : np.ndarray
+        Sorted array of polygon IDs matching ds.polygon coord order.
+    hp_param_df : pd.DataFrame
+        Parameter table with a list of polygons per plant.
+    polygon_list_col : str
+        Column containing list[int] of all polygons associated with the plant.
+    plant_id_col : str
+        Column containing unique hydropower plant IDs.
+    dtype : str | np.dtype
+        Numpy dtype for weight matrix (uint8 or bool recommended).
+
+    Returns
+    -------
+    xr.DataArray
+        Dimensions: ('polygon','hydropower'). Values 0/1 membership.
+    """
+    poly_index = {pid: i for i, pid in enumerate(polygons_all)}
+    plant_ids = hp_param_df[plant_id_col].to_numpy()
+    P = len(polygons_all)
+    H = len(plant_ids)
+    weights = np.zeros((P, H), dtype=dtype)
+    for j, polys in enumerate(hp_param_df[polygon_list_col]):
+        if not isinstance(polys, (list, tuple, np.ndarray)):
+            continue
+        for pid in polys:
+            i = poly_index.get(pid)
+            if i is not None:
+                weights[i, j] = 1
+    return xr.DataArray(
+        weights,
+        dims=("polygon", "hydropower"),
+        coords={"polygon": polygons_all, "hydropower": plant_ids},
+        name="weights",
+    )
+
+
+def build_polygon_plant_weights_sparse(
+    polygons_all: np.ndarray,
+    hp_param_df: pd.DataFrame,
+    polygon_list_col: str = "polygons_full",
+    plant_id_col: str = "WASTANumber",
+):
+    """Create a sparse CSR incidence matrix (polygon x hydropower).
+
+    Returns
+    -------
+    incidence : scipy.sparse.csr_matrix
+    plant_ids : np.ndarray
+    P, H : int
+    """
+    try:
+        import scipy.sparse as sp  # type: ignore
+    except Exception as e:  # noqa: BLE001
+        raise ImportError("scipy is required for sparse weights") from e
+
+    poly_index = {pid: i for i, pid in enumerate(polygons_all)}
+    plant_ids = hp_param_df[plant_id_col].to_numpy()
+    rows = []
+    cols = []
+    data = []
+    for j, polys in enumerate(hp_param_df[polygon_list_col]):
+        if not isinstance(polys, (list, tuple, np.ndarray)):
+            continue
+        for pid in polys:
+            i = poly_index.get(pid)
+            if i is None:
+                continue
+            rows.append(i)
+            cols.append(j)
+            data.append(1.0)
+    P = len(polygons_all)
+    H = len(plant_ids)
+    incidence = sp.csr_matrix((data, (rows, cols)), shape=(P, H))
+    return incidence, plant_ids, P, H
+
+
+def aggregate_polygon_to_plant_flow(
+    ds_polygon_flow: xr.Dataset,
+    weights_da: xr.DataArray,
+    variable: str = "rgs",
+) -> xr.DataArray:
+    """Aggregate polygon flow variable to hydropower plants using dense weights.
+
+    Parameters
+    ----------
+    ds_polygon_flow : xr.Dataset
+        Dataset with dims including ('time','polygon') and the flow variable.
+    weights_da : xr.DataArray
+        Weight matrix (polygon, hydropower) with 0/1 membership.
+    variable : str
+        Name of flow variable in ds_polygon_flow to aggregate.
+
+    Returns
+    -------
+    xr.DataArray
+        Flow per hydropower plant (time, hydropower) in same units as input variable.
+    """
+    if variable not in ds_polygon_flow.data_vars:
+        raise ValueError(f"Variable '{variable}' not in dataset.")
+    # Ensure polygon alignment
+    weights_da = weights_da.sel(polygon=ds_polygon_flow.polygon)
+    flow = xr.dot(ds_polygon_flow[variable], weights_da, dims="polygon")
+    flow.name = "flow"
+    return flow
+
+
+def aggregate_polygon_to_plant_flow_sparse(
+    ds_polygon_flow: xr.Dataset,
+    incidence,
+    plant_ids: np.ndarray,
+    variable: str = "rgs",
+) -> xr.DataArray:
+    """Aggregate using a sparse incidence matrix (polygon x hydropower).
+
+    Parameters
+    ----------
+    ds_polygon_flow : xr.Dataset
+        Dataset with dims ('time','polygon').
+    incidence : scipy.sparse.csr_matrix
+        Sparse matrix shape (P, H).
+    plant_ids : np.ndarray
+        Hydropower plant IDs.
+    variable : str
+        Flow variable name.
+
+    Returns
+    -------
+    xr.DataArray
+        (time, hydropower) aggregated flow.
+    """
+    # dask.array not needed explicitly; operations use existing dask arrays on DataArray
+    if variable not in ds_polygon_flow:
+        raise ValueError(f"Variable '{variable}' not found.")
+    arr = ds_polygon_flow[variable].data  # dask array (time, polygon)
+    # Require polygon single chunk or we map_blocks per polygon chunk
+    if len(arr.chunks[1]) > 1:
+        # rechunk polygon into single chunk for simplified matmul
+        arr = arr.rechunk({1: -1})
+
+    def _matmul(block):  # block shape (t, P)
+        return block @ incidence  # (t, H)
+
+    result = arr.map_blocks(
+        _matmul,
+        dtype=arr.dtype,
+        chunks=(arr.chunks[0], (len(plant_ids),)),
+    )
+    da_out = xr.DataArray(
+        result,
+        dims=("time", "hydropower"),
+        coords={"time": ds_polygon_flow.time, "hydropower": plant_ids},
+        name="flow",
+    )
+    return da_out
+
+
+def compute_generation_vectorized(
+    plant_flow: xr.DataArray,
+    hp_params_df: pd.DataFrame,
+    timestep_hours: float,
+    use_simplified: bool = True,
+    efficiency: float = 0.8,
+    gravity: float = GRAVITY,
+    water_density: float = WATER_DENSITY,
+) -> xr.DataArray:
+    """Compute hydropower generation for all plants vectorized over (time, hydropower).
+
+    Parameters
+    ----------
+    plant_flow : xr.DataArray
+        (time, hydropower) aggregated flow (m^3/s).
+    hp_params_df : pd.DataFrame
+        Parameter table from build_hydropower_parameter_table.
+    timestep_hours : float
+        Length of a model timestep in hours (1 for hourly, 24 for daily).
+    use_simplified : bool
+        If True use simplified efficiency term F (flow * head * F). If False use physics formula.
+    efficiency : float
+        Default turbine efficiency used only when use_simplified=False.
+    gravity : float
+        Gravity constant.
+    water_density : float
+        Water density.
+
+    Returns
+    -------
+    xr.DataArray
+        Energy generation (TWh) per timestep per plant.
+    """
+    wasta = hp_params_df["WASTANumber"].to_numpy()
+    # Broadcast parameter arrays
+    head = xr.DataArray(hp_params_df["hydraulic_head"].to_numpy(), dims=("hydropower",), coords={"hydropower": wasta})
+    design_q = xr.DataArray(hp_params_df["design_discharge"].to_numpy(), dims=("hydropower",), coords={"hydropower": wasta})
+    capacity_MW = xr.DataArray(hp_params_df["installed_capacity_MW"].to_numpy(), dims=("hydropower",), coords={"hydropower": wasta})
+    F = xr.DataArray(hp_params_df["simplified_efficiency_F"].to_numpy(), dims=("hydropower",), coords={"hydropower": wasta})
+
+    # Align hydropower order
+    plant_flow = plant_flow.sel(hydropower=wasta)
+
+    # Clip by design discharge
+    flow_eff = xr.apply_ufunc(
+        np.minimum,
+        plant_flow,
+        design_q,
+        dask="parallelized",
+        output_dtypes=[plant_flow.dtype],
+    )
+
+    dt_seconds = timestep_hours * 3600.0
+    if use_simplified:
+        power_W = flow_eff * head * F  # assumed F in W/(m3/s * m)
+    else:
+        power_W = flow_eff * head * gravity * water_density * efficiency
+
+    energy_Wh = power_W * (dt_seconds / 3600.0)
+    energy_TWh = energy_Wh * 1e-12
+
+    capacity_TWh_step = (capacity_MW * timestep_hours) * 1e-6  # MW*h -> TWh
+    gen = xr.apply_ufunc(
+        np.minimum,
+        energy_TWh,
+        capacity_TWh_step,
+        dask="parallelized",
+        output_dtypes=[energy_TWh.dtype],
+    )
+    gen.name = "gen"
+    return gen
+
+
+def compute_hydropower_production_vectorized(
+    ds_polygon_flow: xr.Dataset,
+    hp_params_df: pd.DataFrame,
+    variable: str = "rgs",
+    timestep_hours: int = 1,
+    weights_sparse: bool = False,
+    output_path: pathlib.Path | None = None,
+    encoding: dict | None = None,
+) -> xr.Dataset:
+    """High-level orchestration for vectorized hydropower generation.
+
+    Steps:
+      1. Build weights (dense or sparse).
+      2. Aggregate polygon flow to plant flow.
+      3. Compute generation vectorized.
+      4. Attach static parameters.
+      5. Optionally write to Zarr/NetCDF.
+    """
+    polygons_all = ds_polygon_flow.polygon.to_numpy()
+    if weights_sparse:
+        incidence, plant_ids, _, _ = build_polygon_plant_weights_sparse(
+            polygons_all, hp_params_df
+        )
+        plant_flow = aggregate_polygon_to_plant_flow_sparse(
+            ds_polygon_flow, incidence, plant_ids, variable=variable
+        )
+    else:
+        weights_da = build_polygon_plant_weights(polygons_all, hp_params_df)
+        plant_flow = aggregate_polygon_to_plant_flow(ds_polygon_flow, weights_da, variable=variable)
+
+    gen = compute_generation_vectorized(
+        plant_flow, hp_params_df, timestep_hours=timestep_hours
+    )
+
+    # Build output Dataset
+    ds_out = xr.Dataset({"gen": gen})
+    # Add parameter coordinates for traceability
+    for col in [
+        "hydraulic_head",
+        "design_discharge",
+        "installed_capacity_MW",
+        "simplified_efficiency_F",
+    ]:
+        if col in hp_params_df.columns:
+            ds_out[col] = ("hydropower", hp_params_df[col].to_numpy())
+
+    if output_path is not None:
+        if encoding is None:
+            encoding = {"gen": {"chunks": {"time": ds_out.dims.get("time", 1)}}}
+        ds_out.to_zarr(output_path, mode="w", encoding=encoding)
+    return ds_out
