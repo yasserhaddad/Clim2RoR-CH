@@ -16,6 +16,16 @@ from src.var_attributes import HYDROPOWER_NETCDF_ENCODINGS
 GRAVITY = 9.81
 WATER_DENSITY = 1000
 
+def mode_of(arr):
+    arr = np.asarray(arr)
+    vals, counts = np.unique(arr, return_counts=True)
+    maxc = counts.max()
+    modes = vals[counts == maxc]
+    # if maxc == 1:
+    #     print("No repeated values (all unique). Returning the smallest value(s) as 'mode':")
+    # print(f"mode count = {maxc}; mode value(s) = {modes}")
+    return modes
+
 def generate_day_of_year_timeseries(year: int):
     """Generate a time series with days of the year (without the year) in datetime format.
 
@@ -524,7 +534,6 @@ def aggregate_streamflow_with_mask(
         return summed.sortby("polygon"), counts.sortby("polygon")
     return summed.sortby("polygon")
 
-
 def build_hydropower_parameter_table(
     df_stats_hydropower: pd.DataFrame,
     df_hydropower_polygons: pd.DataFrame,
@@ -768,62 +777,11 @@ def aggregate_polygon_to_plant_flow(
     flow.name = "flow"
     return flow
 
-
-def aggregate_polygon_to_plant_flow_sparse(
-    ds_polygon_flow: xr.Dataset,
-    incidence,
-    plant_ids: np.ndarray,
-    variable: str = "rgs",
-) -> xr.DataArray:
-    """Aggregate using a sparse incidence matrix (polygon x hydropower).
-
-    Parameters
-    ----------
-    ds_polygon_flow : xr.Dataset
-        Dataset with dims ('time','polygon').
-    incidence : scipy.sparse.csr_matrix
-        Sparse matrix shape (P, H).
-    plant_ids : np.ndarray
-        Hydropower plant IDs.
-    variable : str
-        Flow variable name.
-
-    Returns
-    -------
-    xr.DataArray
-        (time, hydropower) aggregated flow.
-    """
-    # dask.array not needed explicitly; operations use existing dask arrays on DataArray
-    if variable not in ds_polygon_flow:
-        raise ValueError(f"Variable '{variable}' not found.")
-    arr = ds_polygon_flow[variable].data  # dask array (time, polygon)
-    # Require polygon single chunk or we map_blocks per polygon chunk
-    if len(arr.chunks[1]) > 1:
-        # rechunk polygon into single chunk for simplified matmul
-        arr = arr.rechunk({1: -1})
-
-    def _matmul(block):  # block shape (t, P)
-        return block @ incidence  # (t, H)
-
-    result = arr.map_blocks(
-        _matmul,
-        dtype=arr.dtype,
-        chunks=(arr.chunks[0], (len(plant_ids),)),
-    )
-    da_out = xr.DataArray(
-        result,
-        dims=("time", "hydropower"),
-        coords={"time": ds_polygon_flow.time, "hydropower": plant_ids},
-        name="flow",
-    )
-    return da_out
-
-
 def compute_generation_vectorized(
     plant_flow: xr.DataArray,
     hp_params_df: pd.DataFrame,
     timestep_hours: float,
-    use_simplified: bool = True,
+    use_simplified_efficiency: bool = True,
     efficiency: float = 0.8,
     gravity: float = GRAVITY,
     water_density: float = WATER_DENSITY,
@@ -838,10 +796,10 @@ def compute_generation_vectorized(
         Parameter table from build_hydropower_parameter_table.
     timestep_hours : float
         Length of a model timestep in hours (1 for hourly, 24 for daily).
-    use_simplified : bool
+    use_simplified_efficiency : bool
         If True use simplified efficiency term F (flow * head * F). If False use physics formula.
     efficiency : float
-        Default turbine efficiency used only when use_simplified=False.
+        Default turbine efficiency used only when use_simplified_efficiency=False.
     gravity : float
         Gravity constant.
     water_density : float
@@ -872,7 +830,7 @@ def compute_generation_vectorized(
     )
 
     dt_seconds = timestep_hours * 3600.0
-    if use_simplified:
+    if use_simplified_efficiency:
         power_W = flow_eff * head * F  # assumed F in W/(m3/s * m)
     else:
         power_W = flow_eff * head * gravity * water_density * efficiency
@@ -897,7 +855,7 @@ def compute_hydropower_production_vectorized(
     hp_params_df: pd.DataFrame,
     variable: str = "rgs",
     timestep_hours: int = 1,
-    weights_sparse: bool = False,
+    use_simplified_efficiency: int = True,
     output_path: pathlib.Path | None = None,
     encoding: dict | None = None,
 ) -> xr.Dataset:
@@ -911,19 +869,11 @@ def compute_hydropower_production_vectorized(
       5. Optionally write to Zarr/NetCDF.
     """
     polygons_all = ds_polygon_flow.polygon.to_numpy()
-    if weights_sparse:
-        incidence, plant_ids, _, _ = build_polygon_plant_weights_sparse(
-            polygons_all, hp_params_df
-        )
-        plant_flow = aggregate_polygon_to_plant_flow_sparse(
-            ds_polygon_flow, incidence, plant_ids, variable=variable
-        )
-    else:
-        weights_da = build_polygon_plant_weights(polygons_all, hp_params_df)
-        plant_flow = aggregate_polygon_to_plant_flow(ds_polygon_flow, weights_da, variable=variable)
+    weights_da = build_polygon_plant_weights(polygons_all, hp_params_df)
+    plant_flow = aggregate_polygon_to_plant_flow(ds_polygon_flow, weights_da, variable=variable)
 
     gen = compute_generation_vectorized(
-        plant_flow, hp_params_df, timestep_hours=timestep_hours
+        plant_flow, hp_params_df, timestep_hours=timestep_hours, use_simplified_efficiency=use_simplified_efficiency
     )
 
     # Build output Dataset
