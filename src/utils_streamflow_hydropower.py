@@ -552,12 +552,62 @@ def build_hydropower_parameter_table(
     wasta_col_stats: str = "ZE-Nr",
     wasta_col_polygons: str = "WASTANumber",
 ) -> pd.DataFrame:
-    """Create per-plant parameter table for vectorized hydropower generation.
+    """
+    Create per-plant parameter table for vectorized hydropower generation.
 
-    Returns a tidy DataFrame with one row per hydropower plant containing:
-      WASTANumber, polygons_full, installed_capacity_MW, design_discharge,
-      hydraulic_head, simplified_efficiency_F, expected_* generation metrics,
-      percentage_share_CH, Type (if present), and operation dates (if present).
+    Parameters
+    ----------
+    df_stats_hydropower : pandas.DataFrame
+        DataFrame with hydropower statistics (capacity, design discharge, heads, generation, etc.).
+    df_hydropower_polygons : pandas.DataFrame
+        DataFrame mapping hydropower plants to polygon EZGNRs and upstream polygons.
+    gross_head_cols : list[str] or None, optional
+        List of candidate column names in df_stats_hydropower that contain gross head values.
+        If None, a default set of column names is used.
+    allowed_types : list[str] or None, optional
+        If provided, only plants with 'Type' in this list are retained.
+    default_efficiency : float, optional
+        Efficiency used when inferring head from capacity and design discharge (default 0.8).
+    gravity : float, optional
+        Gravity constant used when inferring head (default GRAVITY).
+    water_density : float, optional
+        Water density used when inferring head (default WATER_DENSITY).
+    capacity_col : str, optional
+        Column name in df_stats_hydropower for installed capacity (default "Max. Leistung ab Generator").
+    design_discharge_col : str, optional
+        Column name for design discharge (default "QTurbine [m3/sec]").
+    turbined_flag_col : str, optional
+        Column name indicating whether the plant turbines (default "Funktion: Turbinieren").
+    yearly_generation_col : str, optional
+        Column name for yearly generation (default "Prod. ohne Umwälzbetrieb - J.").
+    summer_generation_col : str, optional
+        Column name for summer generation (default "Prod. ohne Umwälzbetrieb - S.").
+    winter_generation_col : str, optional
+        Column name for winter generation (default "Prod. ohne Umwälzbetrieb - W.").
+    percentage_share_col : str, optional
+        Column name for percentage share in CH (default "Proz. Anteil CH").
+    wasta_col_stats : str, optional
+        Column name in df_stats_hydropower containing the WASTA identifier (default "ZE-Nr").
+    wasta_col_polygons : str, optional
+        Column name in df_hydropower_polygons containing the WASTA identifier (default "WASTANumber").
+
+    Returns
+    -------
+    pandas.DataFrame
+        Tidy DataFrame with one row per hydropower plant containing at minimum the following columns:
+        - WASTANumber: plant identifier
+        - polygons_full: list of associated polygon EZGNRs (base + upstream)
+        - hydraulic_head: inferred or reported hydraulic head (m)
+        - simplified_efficiency_F: simplified efficiency term F
+        - installed_capacity_MW, design_discharge: original columns renamed for consistency
+        - expected_* generation metrics and percentage_share_CH where available
+        May also include Type, ZE-Name, BeginningOfOperation, EndOfOperation if present in inputs.
+
+    Notes
+    -----
+    - Hydraulic head is inferred from available gross head columns or, if missing, from capacity and design
+      discharge using the provided default_efficiency, gravity and water_density.
+    - Plants with missing or non-positive capacity, design discharge or head are filtered out.
     """
     if gross_head_cols is None:
         gross_head_cols = [
@@ -658,9 +708,6 @@ def build_hydropower_parameter_table(
     return param_df
 
 
-# --------------------------------------------------------------------------------------
-# Vectorized hydropower production pipeline (Steps 2–5)
-# --------------------------------------------------------------------------------------
 def build_polygon_plant_weights(
     polygons_all: np.ndarray,
     hp_param_df: pd.DataFrame,
@@ -706,47 +753,6 @@ def build_polygon_plant_weights(
         coords={"polygon": polygons_all, "hydropower": plant_ids},
         name="weights",
     )
-
-
-def build_polygon_plant_weights_sparse(
-    polygons_all: np.ndarray,
-    hp_param_df: pd.DataFrame,
-    polygon_list_col: str = "polygons_full",
-    plant_id_col: str = "WASTANumber",
-):
-    """Create a sparse CSR incidence matrix (polygon x hydropower).
-
-    Returns
-    -------
-    incidence : scipy.sparse.csr_matrix
-    plant_ids : np.ndarray
-    P, H : int
-    """
-    try:
-        import scipy.sparse as sp  # type: ignore
-    except Exception as e:  # noqa: BLE001
-        raise ImportError("scipy is required for sparse weights") from e
-
-    poly_index = {pid: i for i, pid in enumerate(polygons_all)}
-    plant_ids = hp_param_df[plant_id_col].to_numpy()
-    rows = []
-    cols = []
-    data = []
-    for j, polys in enumerate(hp_param_df[polygon_list_col]):
-        if not isinstance(polys, (list, tuple, np.ndarray)):
-            continue
-        for pid in polys:
-            i = poly_index.get(pid)
-            if i is None:
-                continue
-            rows.append(i)
-            cols.append(j)
-            data.append(1.0)
-    P = len(polygons_all)
-    H = len(plant_ids)
-    incidence = sp.csr_matrix((data, (rows, cols)), shape=(P, H))
-    return incidence, plant_ids, P, H
-
 
 def aggregate_polygon_to_plant_flow(
     ds_polygon_flow: xr.Dataset,
@@ -890,6 +896,6 @@ def compute_hydropower_production_vectorized(
 
     if output_path is not None:
         if encoding is None:
-            encoding = {"gen": {"chunks": {"time": ds_out.dims.get("time", 1)}}}
+            encoding = {"gen": {"chunks": (int(24 * 365 / timestep_hours), ds_out.sizes["hydropower"])}}
         ds_out.to_zarr(output_path, mode="w", encoding=encoding)
     return ds_out

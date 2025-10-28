@@ -19,7 +19,12 @@ from src.utils_polygons import (
     find_upstream_polygons_recursive,
     flatten_list,
     get_points_in_polygons,
+    build_prevah_grid_points,
+    build_prevah_grid_cells,
+    map_polygons_to_grid_by_intersection,
+    fill_missing_polygons_by_nearest,
 )
+
 from src.utils_streamflow_hydropower import (
     GRAVITY,
     WATER_DENSITY,
@@ -30,7 +35,7 @@ from src.utils_streamflow_hydropower import (
     convert_mm_d_to_cubic_m_s,
     build_hydropower_parameter_table,
     compute_hydropower_production_vectorized,
-    mode_of
+    mode_of,
 )
 from src.var_attributes import ACCUM_HYDRO_ZARR_ENCODING
 
@@ -44,13 +49,28 @@ os.environ["USE_PYGEOS"] = "1"
 import dask
 from dask.diagnostics import ProgressBar
 import geopandas as gpd
+import argparse
 
 DEFAULT_EFFICIENCY = 0.8
 
 
+def make_encoding(ds: xr.Dataset | xr.DataArray, compressor, chunk_dict):
+    encoding = {}
+    data_vars = ds.data_vars if isinstance(ds, xr.Dataset) else {ds.name: ds}
+    for var in data_vars:
+        dims = data_vars[var].dims
+        chunks = tuple(chunk_dict.get(d, data_vars[var].sizes[d]) for d in dims)
+        encoding[var] = {"compressor": compressor, "chunks": chunks}
+    return encoding
+
+
 class DataProcessingDask:
     def __init__(
-        self, paths_file: str, climate_model_chain: str, climate_scenario: str,
+        self,
+        paths_file: str,
+        climate_model_chain: str,
+        climate_scenario: str,
+        weighted_sum: bool = True,
     ):
         print("Loading data")
         paths = json.load(open(paths_file))
@@ -138,6 +158,36 @@ class DataProcessingDask:
 
         self.df_hydropower_polygons = None
         self.ds_accumulated_streamflow_polygon = None
+        self.weighted = weighted_sum
+        self.grid_pt_in_polygon = None
+
+        if climate_model_chain is None and climate_scenario is None:
+            self.df_prevah_pts_in_polygons_filename = (
+                "df_prevah_obs_pts_in_polygons"
+            )
+            self.accumulated_streamflow_per_polygon_filename = (
+                "ds_prevah_obs_streamflow_accum_per_polygon"
+            )
+            self.accumulated_streamflow_per_polygon_filename += (
+                "_weighted.zarr" if weighted_sum else ".zarr"
+            )
+            self.hydropower_production_filename = (
+                "ds_prevah_obs_hydropower_production_ror.zarr"
+            )
+        else:
+            self.df_prevah_pts_in_polygons_filename = (
+                "df_prevah_proj_pts_in_polygons"
+            )
+            self.accumulated_streamflow_per_polygon_filename = f"ds_prevah_{climate_model_chain}_{climate_scenario}_streamflow_accum_per_polygon"
+
+            self.hydropower_production_filename = f"ds_prevah_{climate_model_chain}_{climate_scenario}_hydropower_production_ror.zarr"
+
+        self.df_prevah_pts_in_polygons_filename += (
+            "_weighted.csv" if weighted_sum else ".csv"
+        )
+        self.accumulated_streamflow_per_polygon_filename += (
+            "_weighted.zarr" if weighted_sum else ".zarr"
+        )
 
     def convert_bin_to_netcdf_runoff_prevah(self) -> None:
         """Extracts runoff values from gz binary PREVAH data and stores them in
@@ -161,7 +211,9 @@ class DataProcessingDask:
         )
 
     def extract_points_in_polygons(
-        self, output_filename: str = "df_prevah_pts_in_polygons.csv", prevah_grid_resolution: float = 500
+        self,
+        prevah_grid_resolution: float = 500,
+        output_filename: str = "df_prevah_500_pts_in_polygons.csv",
     ) -> None:
         """Extracts points from the PREVAH grid that are located in the polygons of Swiss waterbodies.
 
@@ -169,35 +221,21 @@ class DataProcessingDask:
         ----------
         output_filename : str, optional
             Name of output file containing the DataFrame of the points present in each polygon,
-            by default "df_prevah_pts_in_polygons.csv"
+            by default "df_prevah_500_pts_in_polygons.csv"
         """
+        if output_filename is None:
+            output_filename = self.df_prevah_pts_in_polygons_filename
         print("Extracting dataset grid points in polygons")
         time_start = time.time()
         # Load sample runoff data
         ds_sample = xr.open_zarr(self.path_data_prevah / "rgs.zarr", chunks="auto")
-
-        # Transform a sample runoff grid into a GeoDataFrame to use operations included in GeoPandas
-        df_runoff = ds_sample.isel(time=0)
-        new_x = (
-            np.round(df_runoff.x.values / prevah_grid_resolution) * prevah_grid_resolution
-        ).astype(df_runoff.x.dtype)
-        new_y = (
-            np.round(df_runoff.y.values / prevah_grid_resolution) * prevah_grid_resolution
-        ).astype(df_runoff.y.dtype)
-        df_runoff = df_runoff.assign_coords(x=new_x, y=new_y)
-        df_runoff = df_runoff.to_dataframe().reset_index()
-
-        gdf_runoff = gpd.GeoDataFrame(
-            df_runoff,
-            geometry=gpd.points_from_xy(df_runoff.x, df_runoff.y),
-            crs="EPSG:2056",
-        )[["y", "x", "geometry"]]
+        gdf_runoff_points = build_prevah_grid_points(ds_sample, prevah_grid_resolution)
         del ds_sample
 
         # Get points in polygons and speed it up by launching multiple processes in parallel
         step = 500
         split_gdfs = [
-            self.gdf_polygons.iloc[i : i + step]
+            self.gdf_polygons.iloc[i : i + 500]
             for i in range(0, len(self.gdf_polygons), step)
         ]
 
@@ -206,14 +244,14 @@ class DataProcessingDask:
             list_gdfs = [
                 ds
                 for ds in p.starmap(
-                    get_points_in_polygons, zip(split_gdfs, repeat(gdf_runoff))
+                    get_points_in_polygons, zip(split_gdfs, repeat(gdf_runoff_points))
                 )
             ]
 
         df_concat = pd.DataFrame(
             pd.concat(list_gdfs, ignore_index=True).drop(columns="geometry")
         ).sort_values(by="EZGNR")
-        print(df_concat["EZGNR"].nunique(), "polygons with points.")
+
         df_concat[["index_left", "EZGNR", "TEILEZGNR", "y", "x"]].to_csv(
             self.path_data_polygons / output_filename, index=False
         )
@@ -225,9 +263,128 @@ class DataProcessingDask:
             f"\tExtracted successfully all points in polygons! Time elapsed: {(time.time() - time_start)/60:.2f} minutes."
         )
 
+    def extract_points_in_polygons_weighted(
+        self,
+        prevah_grid_resolution: float = 500,
+        fraction_overlap: float = 0.01,
+        max_distance_nearest: float = None,
+        output_filename: str = "df_prevah_pts_in_polygons.csv",
+    ) -> None:
+        """Extracts points from the PREVAH grid that are located in the polygons of Swiss waterbodies.
+
+        Parameters
+        ----------
+        output_filename : str, optional
+            Name of output file containing the DataFrame of the points present in each polygon,
+            by default "df_prevah_pts_in_polygons.csv"
+        """
+        if output_filename is None:
+            output_filename = self.df_prevah_pts_in_polygons_filename
+
+        print("Extracting dataset grid points in polygons")
+        time_start = time.time()
+        # Load sample runoff data
+        ds_sample = xr.open_zarr(self.path_data_prevah / "rgs.zarr", chunks="auto")
+        gdf_runoff_points = build_prevah_grid_points(ds_sample, prevah_grid_resolution)
+        del ds_sample
+
+        x_coords = np.sort(gdf_runoff_points.x.unique())
+        y_coords = np.sort(gdf_runoff_points.y.unique())
+        gdf_grid_cells = build_prevah_grid_cells(
+            x_coords, y_coords, prevah_grid_resolution, crs="EPSG:2056"
+        )
+        gdf_grid_points = gpd.GeoDataFrame(
+            {
+                "x": gdf_grid_cells.x,
+                "y": gdf_grid_cells.y,
+                "geometry": gdf_grid_cells.geometry.centroid,
+            },
+            crs=gdf_grid_cells.crs,
+        )
+
+        # Get points in polygons and speed it up by launching multiple processes in parallel
+        step = 500
+        split_gdfs = [
+            self.gdf_polygons.iloc[i : i + step]
+            for i in range(0, len(self.gdf_polygons), step)
+        ]
+        print(len(split_gdfs), " polygon splits to process.")
+        print("Total polygons:", len(self.gdf_polygons))
+
+        num_workers = 20
+        with Pool(num_workers) as p:
+            list_gdfs = [
+                ds
+                for ds in p.starmap(
+                    map_polygons_to_grid_by_intersection,
+                    zip(split_gdfs, repeat(gdf_grid_cells), repeat(fraction_overlap)),
+                )
+            ]
+
+        df_intersections = pd.DataFrame(
+            pd.concat(list_gdfs, ignore_index=True)
+        ).sort_values(by="EZGNR")
+        print(df_intersections["EZGNR"].nunique(), "polygons with points.")
+
+        # Fallback: assign nearest grid cell for polygons with no overlap
+        polygons_with_weight = (
+            set(df_intersections["EZGNR"].unique())
+            if not df_intersections.empty
+            else set()
+        )
+        missing_polygons = (
+            set(self.gdf_polygons["EZGNR"].unique()) - polygons_with_weight
+        )
+        if missing_polygons:
+            print(
+                f"{len(missing_polygons)} polygons with no overlapping grid cells, assigning nearest grid cell as fallback."
+            )
+            df_nearest = fill_missing_polygons_by_nearest(
+                self.gdf_polygons,
+                gdf_grid_points,
+                list(missing_polygons),
+                max_distance=max_distance_nearest,
+            )
+            if not df_nearest.empty:
+                df_nearest["cell_area"] = float(prevah_grid_resolution**2)
+                df_nearest["intersect_area"] = df_nearest["cell_area"]
+                df_nearest["weight"] = 1.0
+                df_intersections = pd.concat(
+                    [
+                        df_intersections,
+                        df_nearest[
+                            ["x", "y", "EZGNR", "cell_area", "intersect_area", "weight"]
+                        ],
+                    ],
+                    ignore_index=True,
+                )
+
+        # Build final CSV: keep one row per polygon×cell with fractional weight
+        if df_intersections.empty:
+            raise RuntimeError(
+                "No polygon-cell intersections found (check CRS and grid coordinates)."
+            )
+
+        # Add an index_left matching previous expected column (unique cell index)
+        df_intersections = df_intersections.reset_index(drop=True)
+        df_intersections["index_left"] = df_intersections.index.astype(int)
+        df_out = df_intersections.sort_values(by=["EZGNR", "y", "x"])
+        print(
+            df_out["EZGNR"].nunique(),
+            "polygons assigned (area-weighted including nearest-fallback).",
+        )
+        df_out.to_csv(self.path_data_polygons / output_filename, index=False)
+        self.df_prevah_pts_in_polygons = pd.read_csv(
+            self.path_data_polygons / output_filename
+        )
+
+        print(
+            f"\tExtracted successfully all polygon-cell weights! Time elapsed: {(time.time() - time_start)/60:.2f} minutes."
+        )
+
     def create_prevah_polygon_grid(
         self,
-        df_prevah_pts_in_polygons_filename: str = "df_prevah_pts_in_polygons.csv",
+        df_pts: pd.DataFrame,
         prevah_grid_resolution: float = 500,
         fill_value: int = -1,
     ) -> xr.DataArray:
@@ -243,14 +400,6 @@ class DataProcessingDask:
         Notes:
         - If multiple polygon ids exist for the same grid cell, the first is kept.
         """
-        # load points-in-polygons table if required
-        if self.df_prevah_pts_in_polygons is None:
-            self.df_prevah_pts_in_polygons = pd.read_csv(
-                self.path_data_polygons / df_prevah_pts_in_polygons_filename
-            )
-
-        df_pts = self.df_prevah_pts_in_polygons.copy()
-
         # ensure columns exist and correct dtypes
         if (
             "x" not in df_pts.columns
@@ -295,10 +444,67 @@ class DataProcessingDask:
         ).astype(da.y.dtype)
         da = da.assign_coords(x=new_x, y=new_y)
 
-        # save to zarr for later quick loading
         self.grid_pt_in_polygon = da
 
         return da
+
+    def create_polygon_weight_array(
+        self,
+        ds_rgs: xr.Dataset,
+        df_pts: pd.DataFrame,
+        output_filename: str = "prevah_polygon_weights.zarr",
+    ) -> xr.DataArray:
+        # align coords and build indices
+        x_coords = np.sort(ds_rgs.x.values)
+        y_coords = np.sort(ds_rgs.y.values)
+        polygons = np.sort(df_pts["EZGNR"].unique())
+        poly_index = {pid: i for i, pid in enumerate(polygons)}
+        x_index = {float(x): i for i, x in enumerate(x_coords)}
+        y_index = {float(y): i for i, y in enumerate(y_coords)}
+
+        # Build dense weight array (y, x, polygon)
+        W = np.zeros((len(y_coords), len(x_coords), len(polygons)), dtype="f4")
+        for _, row in df_pts.iterrows():
+            x = float(row["x"])
+            y = float(row["y"])
+            ezgnr = int(row["EZGNR"])
+            w = float(row.get("weight", 1.0))
+            xi = x_index.get(x)
+            yi = y_index.get(y)
+            pi = poly_index.get(ezgnr)
+            if xi is None or yi is None or pi is None:
+                continue
+            W[yi, xi, pi] += w
+        # Build xr.DataArray of weights aligned with ds_rgs
+        weights_da = xr.DataArray(
+            W,
+            dims=("y", "x", "polygon"),
+            coords={"y": y_coords, "x": x_coords, "polygon": polygons},
+            name="weights",
+        )
+
+        if output_filename is not None:
+            print("Saving polygon weights array to Zarr")
+            chunks = {
+                "x": ds_rgs.chunks["x"][0],
+                "y": ds_rgs.chunks["y"][0],
+                "polygon": 1000,
+            }
+            encoding = make_encoding(
+                weights_da,
+                compressor=ACCUM_HYDRO_ZARR_ENCODING["compressor"],
+                chunk_dict=chunks,
+            )
+            with ProgressBar(dt=10):
+                weights_da.chunk(chunks).to_zarr(
+                    self.path_data_polygons / output_filename,
+                    mode="w",
+                    encoding=encoding,
+                )
+
+        self.grid_pt_in_polygon = weights_da
+
+        return weights_da
 
     def compute_accumulated_streamflow_per_polygon(
         self,
@@ -325,19 +531,19 @@ class DataProcessingDask:
             streamflow at each polygon, by default "ds_prevah_500_streamflow_accum_per_polygon"
         """
         time_start = time.time()
+        if output_filename is None:
+            output_filename = self.accumulated_streamflow_per_polygon_filename
+        if df_prevah_pts_in_polygons_filename is None:
+            df_prevah_pts_in_polygons_filename = self.df_prevah_pts_in_polygons_filename
+
         relevant_polygons = self.gdf_polygons.EZGNR.to_numpy()
         if self.df_prevah_pts_in_polygons is None:
             self.df_prevah_pts_in_polygons = pd.read_csv(
                 self.path_data_polygons / df_prevah_pts_in_polygons_filename
             )
-        if self.grid_pt_in_polygon is None:
-            self.create_prevah_polygon_grid(
-                df_prevah_pts_in_polygons_filename=df_prevah_pts_in_polygons_filename,
-                fill_value=grid_fill_value,
-            )
 
         # Converting streamflow to accumulated streamflow per polygon
-        print("Computing accumulated streamflow")
+        print("Computing accumulated streamflow per polygon")
         ds_rgs = xr.open_zarr(self.path_data_prevah / "rgs.zarr", chunks="auto")
         new_x = (
             np.round(ds_rgs.x.values / prevah_grid_resolution) * prevah_grid_resolution
@@ -358,90 +564,112 @@ class DataProcessingDask:
             )
         )
 
-        chunks_spatial = {"x": mode_of(ds_rgs.chunks["x"])[0], "y": mode_of(ds_rgs.chunks["y"])[0]}
-        with ProgressBar(dt=10):
-            ds_accum = aggregate_streamflow_with_mask(
-                ds_rgs,
-                self.grid_pt_in_polygon.chunk(chunks_spatial),
-                method="sum",
-                fill_value=grid_fill_value,
-                polygons=relevant_polygons,
+        chunks_spatial = {
+            "x": mode_of(ds_rgs.chunks["x"])[0],
+            "y": mode_of(ds_rgs.chunks["y"])[0],
+        }
+        if self.df_prevah_pts_in_polygons is not None:
+            if self.weighted:
+                print("Using fractional weights for polygon-grid cell mapping.")
+                if self.grid_pt_in_polygon is None:
+                    self.create_polygon_weight_array(
+                        ds_rgs,
+                        self.df_prevah_pts_in_polygons.copy(),
+                        output_filename=None,
+                    )
+            else:
+                print(
+                    "No weights found, assuming uniform weights for polygon-grid cell mapping."
+                )
+                if self.grid_pt_in_polygon is None:
+                    self.create_prevah_polygon_grid(
+                        df_pts=self.df_prevah_pts_in_polygons.copy(),
+                        fill_value=grid_fill_value,
+                    )
+        if self.weighted:
+            self.grid_pt_in_polygon = self.grid_pt_in_polygon.chunk(
+                {
+                    "x": ds_rgs.chunks["x"][0],
+                    "y": ds_rgs.chunks["y"][0],
+                    "polygon": 1000,
+                }
             )
+        else:
+            self.grid_pt_in_polygon = self.grid_pt_in_polygon.chunk(chunks_spatial)
+
+        with ProgressBar(dt=10):
+            if self.weighted:
+                accum_vars = {
+                    var: xr.dot(
+                        ds_rgs[var].fillna(0), self.grid_pt_in_polygon, dims=("y", "x")
+                    )
+                    for var in ds_rgs.data_vars
+                }
+                ds_accum = xr.Dataset(accum_vars)
+            else:
+                ds_accum = aggregate_streamflow_with_mask(
+                    ds_rgs,
+                    self.grid_pt_in_polygon,
+                    method="sum",
+                    fill_value=grid_fill_value,
+                    polygons=relevant_polygons,
+                )
 
             ds_accum = ds_accum.sel(
-                time=~(ds_accum.time.dt.month == 2) & ~(ds_accum.time.dt.day == 29)
+                time=~((ds_accum.time.dt.month == 2) & (ds_accum.time.dt.day == 29))
             )
-            encoding = {
-                var: {
-                    "compressor": ACCUM_HYDRO_ZARR_ENCODING["compressor"],
-                    "chunks": {"time": 365, "polygon": 1000},
-                }
-                for var in list(ds_accum.data_vars.keys())
-            }
+
+            chunks_accum = {"time": 365, "polygon": 1000}
+            encoding = make_encoding(
+                ds_accum,
+                compressor=ACCUM_HYDRO_ZARR_ENCODING["compressor"],
+                chunk_dict=chunks_accum,
+            )
             encoding["time"] = {
                 "units": f"seconds since {np.datetime_as_string(ds_accum.time[0].values)}"
             }
 
-            output_filepath = self.path_data_prevah / f"{output_filename}.zarr"
-            ds_accum.to_zarr(output_filepath, mode="w", encoding=encoding)
+            output_filepath = self.path_data_prevah / f"{output_filename}"
+            ds_accum.chunk(chunks_accum).to_zarr(
+                output_filepath, mode="w", encoding=encoding
+            )
 
             new_end_time = ds_accum.time[-1] + np.timedelta64(23, "h")
             ds_accum_hourly = ds_accum.reindex(
                 time=pd.date_range(
                     start=ds_accum.time[0].values,
                     end=new_end_time.values,
-                    freq="1H",
+                    freq="1h",
                     inclusive="both",
                 ),
                 method="ffill",
             )
             ds_accum_hourly = ds_accum_hourly.sel(
-                time=~(ds_accum_hourly.time.dt.month == 2)
-                & ~(ds_accum_hourly.time.dt.day == 29)
+                time=~(
+                    (ds_accum_hourly.time.dt.month == 2)
+                    & (ds_accum_hourly.time.dt.day == 29)
+                )
             )
-            encoding = {
-                var: {
-                    "compressor": ACCUM_HYDRO_ZARR_ENCODING["compressor"],
-                    "chunks": {"time": 8760, "polygon": 1000},
-                }
-                for var in list(ds_accum_hourly.data_vars.keys())
+            chunks_accum = {"time": 8760, "polygon": 1000}
+            encoding = make_encoding(
+                ds_accum_hourly,
+                compressor=ACCUM_HYDRO_ZARR_ENCODING["compressor"],
+                chunk_dict=chunks_accum,
+            )
+            encoding["time"] = {
+                "units": f"seconds since {np.datetime_as_string(ds_accum_hourly.time[0].values)}"
             }
-            output_filepath = self.path_data_prevah / f"{output_filename}_hourly.zarr"
-            ds_accum_hourly.to_zarr(output_filepath, mode="w", encoding=encoding)
+            output_filepath = self.path_data_prevah / f"{output_filename.remove_suffix('.zarr')}_hourly.zarr"
+            ds_accum_hourly.chunk(chunks_accum).to_zarr(
+                output_filepath, mode="w", encoding=encoding
+            )
             self.ds_accumulated_streamflow_polygon = ds_accum_hourly
+
+            print(f"\tSaved accumulated streamflow per polygon to Zarr: {output_filepath}")
 
         print(
             f"\tTotal time for accumulated streamflow: {(time.time() - time_start)/60:.2f} minutes."
         )
-
-    def get_df_upstream_polygons(self) -> pd.DataFrame:
-        """Get all upstream polygons of each polygon in a pandas DataFrame containing the connectivity
-        between polygons.
-
-        Returns
-        -------
-        pd.DataFrame
-            pandas DataFrame containing polygons and their corresponding
-            upstream polygons, identified by their EZGNR
-        """
-        df_polygon_connectivity = pd.read_csv(
-            self.path_data_polygons / "st2km2_ConnectivityEZGNR_polyg.csv"
-        )
-        df_upstream_polygons = (
-            df_polygon_connectivity.groupby("tEZGNR")["fEZGNR"]
-            .apply(list)
-            .reset_index()
-        )
-        df_upstream_polygons.columns = ["EZGNR", "upstream_EZGNR"]
-
-        df_upstream_polygons["upstream_EZGNR"] = df_upstream_polygons.apply(
-            lambda row: find_upstream_polygons_recursive(
-                df_upstream_polygons, row["EZGNR"]
-            ),
-            axis=1,
-        )
-
-        return df_upstream_polygons
 
     def get_hydropower_polygons(
         self, df_upstream_polygons: pd.DataFrame
@@ -573,91 +801,6 @@ class DataProcessingDask:
 
         return df_hydropower_polygons_to_update
 
-    def get_catchment_area_per_hydropower(self):
-        """Get the catchment area of each hydropower plant in the WASTA database.
-        Each power plant is linked to the polygon containing it and their upstream area.
-        Some power plants have been inspected manually and new polygons have been assigned
-        to them.
-        """
-        print(
-            "Extracting catchment area of each hydropower plant in the WASTA database"
-        )
-        time_start = time.time()
-        # Get catchment area (all upstream polygons) of hydropower plant
-        df_upstream_polygons = self.get_df_upstream_polygons()
-
-        # Get catchment containing the hydropower plants and its upstream polygons
-        df_hydropower_polygons = self.get_hydropower_polygons(df_upstream_polygons)
-
-        # Get polygons of hydropower plants to update
-        df_hydropower_polygons_to_update = self.get_hydropower_plants_to_update(
-            self.get_water_intake_polygons()
-        )
-
-        # Update hydropower information with manually assigned polygons, turn the EZGNR field into a list
-        df_hydropower_polygons.loc[:, "EZGNR"] = df_hydropower_polygons.apply(
-            lambda row: [row["EZGNR"]]
-            if row["WASTANumber"] not in df_hydropower_polygons_to_update["WASTANumber"]
-            else df_hydropower_polygons_to_update.loc[
-                df_hydropower_polygons_to_update["WASTANumber"] == row["WASTANumber"],
-                "New EZGNR",
-            ],
-            axis=1,
-        )
-        # Re-compute upstream EZGNR for updated hydropower plants
-        df_hydropower_polygons.loc[
-            df_hydropower_polygons["WASTANumber"].isin(
-                df_hydropower_polygons_to_update["WASTANumber"]
-            ),
-            "upstream_EZGNR",
-        ] = df_hydropower_polygons[
-            df_hydropower_polygons["WASTANumber"].isin(
-                df_hydropower_polygons_to_update["WASTANumber"]
-            )
-        ].apply(
-            lambda row: list(
-                set(
-                    flatten_list(
-                        [
-                            find_upstream_polygons_recursive(
-                                df_upstream_polygons, catchment
-                            )
-                            for catchment in row["EZGNR"]
-                        ]
-                    )
-                )
-            ),
-            axis=1,
-        )
-
-        # Fill NaN for upstream polygons with empty list
-        df_hydropower_polygons.loc[:, "upstream_EZGNR"] = (
-            df_hydropower_polygons["upstream_EZGNR"].fillna("").apply(list)
-        )
-
-        # Save dataframe matching hydropower plant locations with the BAFU catchments
-        output_path = self.path_data_hydro / "hydropower_polygons"
-        output_path.mkdir(parents=True, exist_ok=True)
-        df_hydropower_polygons = df_hydropower_polygons[
-            [
-                "WASTANumber",
-                "Name",
-                "Type",
-                "_x",
-                "_y",
-                "EZGNR",
-                "upstream_EZGNR",
-            ]
-        ]
-        df_hydropower_polygons.to_json(
-            self.path_data_hydro
-            / "hydropower_polygons"
-            / "df_hydropower_polygons.json",
-            orient="records",
-        )
-        self.df_hydropower_polygons = df_hydropower_polygons
-        print(f"Time elapsed: {(time.time() - time_start)/60:.2f} minutes.")
-
     def build_polygon_plant_weights(
         self,
         polygon_col="polygons_full",
@@ -666,7 +809,8 @@ class DataProcessingDask:
         if self.ds_accumulated_streamflow_polygon is None:
             self.ds_accumulated_streamflow_polygon = xr.open_zarr(
                 self.path_data_prevah
-                / "ds_prevah_500_streamflow_accum_per_polygon_hourly.zarr"
+                / self.accumulated_streamflow_per_polygon_filename,
+                chunks="auto",
             )
         polygons_all = self.ds_accumulated_streamflow_polygon.polygon.values
         hp_param_df = build_hydropower_parameter_table(
@@ -692,166 +836,13 @@ class DataProcessingDask:
             name="weights",
         )
 
-    def compute_hydropower_production(
-        self,
-        accumulated_streamflow_per_polygon_filename: str = "ds_prevah_500_streamflow_accum_per_polygon_hourly.zarr",
-        output_filename_prefix="ds_prevah_500_hydropower_production_ror",
-    ) -> None:
-        """Compute the hydropower production by converting the accumulated streamflow at the polygon assigned
-        as water intake point of the hydropower plant into energy quantities.
-
-        Parameters
-        ----------
-        accumulated_streamflow_per_polygon_filename : str, optional
-            Name of netcdf file containing the accumulated streamflow at each polygon
-            for every time step, by default "ds_prevah_500_streamflow_accum_per_polygon_hourly.zarr"
-        output_filename_prefix : str, optional
-            Prefix to add to each filename of the outputs to save, by default
-            "ds_prevah_500_hydropower_production_ror"
-        """
-        # Load hydropower polygons
-        if self.df_hydropower_polygons is None:
-            self.df_hydropower_polygons = pd.read_json(
-                self.path_data_hydro
-                / "hydropower_polygons"
-                / "df_hydropower_polygons.json",
-                orient="records",
-            )
-        # Load accumulated streamflow per polygon
-        if self.ds_accumulated_streamflow_polygon is None:
-            self.ds_accumulated_streamflow_polygon = xr.open_zarr(
-                self.path_data_prevah / accumulated_streamflow_per_polygon_filename
-            )
-
-        # --------------------------------------------------------------------------------------------------
-        # Converting accumulated streamflow into hydropower generation
-        print("Computing hydropower generation")
-
-        gross_head_cols = [
-            "Maxim. Bruttofallhöhe [m]",
-            "Minim. Bruttofallhöhe [m]",
-            "Maxim. Nettofallhöhe [m]",
-        ]
-        allowed_types = ["L"]
-        time_start = time.time()
-
-        df_hydropower_to_process = self.df_hydropower_polygons[
-            (self.df_hydropower_polygons["Type"].isin(allowed_types))
-        ]
-        nb_hp = len(df_hydropower_to_process)
-
-        list_ds = []
-        list_parameters = []
-
-        for idx, (_, hydropower_info) in enumerate(df_hydropower_to_process.iterrows()):
-            relevant_polygons = (
-                hydropower_info["EZGNR"] + hydropower_info["upstream_EZGNR"]
-            )
-            relevant_stats_row = self.df_stats_hydropower_ch[
-                self.df_stats_hydropower_ch["ZE-Nr"] == hydropower_info["WASTANumber"]
-            ]
-            installed_capacity = relevant_stats_row["Max. Leistung ab Generator"].item()
-            design_discharge = relevant_stats_row["QTurbine [m3/sec]"].item()
-            expected_generation = relevant_stats_row[
-                "Prod. ohne Umwälzbetrieb - J."
-            ].item()
-            expected_summer_generation = relevant_stats_row[
-                "Prod. ohne Umwälzbetrieb - S."
-            ].item()
-            expected_winter_generation = relevant_stats_row[
-                "Prod. ohne Umwälzbetrieb - W."
-            ].item()
-            is_turbined = relevant_stats_row["Funktion: Turbinieren"].item()
-
-            if design_discharge == 0 or pd.isna(is_turbined):
-                print(
-                    f"\n\t{hydropower_info['WASTANumber']}\t{installed_capacity}\t{design_discharge}"
-                )
-                continue
-
-            hydraulic_head = relevant_stats_row[gross_head_cols].to_numpy()
-            hydraulic_head = hydraulic_head[hydraulic_head > 0]
-            if len(hydraulic_head) == 0:
-                try:
-                    hydraulic_head = int(
-                        installed_capacity
-                        * 1e6
-                        / (
-                            design_discharge
-                            * GRAVITY
-                            * WATER_DENSITY
-                            * DEFAULT_EFFICIENCY
-                        )
-                    )
-                except ZeroDivisionError:
-                    print(
-                        f"\n{hydropower_info['WASTANumber']}\t{installed_capacity}\t{design_discharge}"
-                    )
-            else:
-                hydraulic_head = hydraulic_head[0]
-
-            F = round(
-                compute_simplified_efficiency_term(
-                    installed_capacity * 1e6, design_discharge, hydraulic_head
-                ),
-                2,
-            )
-
-            ds = compute_ds_hydropower_generation_from_streamflow(
-                self.ds_accumulated_streamflow_polygon,
-                hydropower_info["WASTANumber"],
-                relevant_polygons,
-                hydraulic_head,
-                DEFAULT_EFFICIENCY,
-                simplified_efficiency=F,
-                design_discharge=design_discharge,
-                installed_capacity=installed_capacity * 1e-6,
-            )
-
-            list_parameters.append(
-                {
-                    "WASTANumber": hydropower_info["WASTANumber"],
-                    "Name": relevant_stats_row["ZE-Name"].item(),
-                    "Capacity": installed_capacity,
-                    "Design discharge": design_discharge,
-                    "Hydraulic head": hydraulic_head,
-                    "Expected yearly generation": expected_generation,
-                    "Expected winter generation": expected_winter_generation,
-                    "Expected summer generation": expected_summer_generation,
-                    "Percentage share CH": relevant_stats_row["Proz. Anteil CH"].item(),
-                    "F": F,
-                }
-            )
-            list_ds.append(ds)
-            del ds
-            print(
-                f"\t{idx+1}/{nb_hp}, elapsed_time: {(time.time() - time_start)/60:.2f} minutes.",
-                end="\r",
-            )
-
-        output_filepath = (
-            self.path_data_hydro
-            / "hydropower_generation"
-            / f"{output_filename_prefix}.zarr"
-        )
-        concat_list_ds_and_save(list_ds, output_filepath)
-
-        pd.DataFrame(list_parameters).to_csv(
-            self.path_data_hydro
-            / "hydropower_generation"
-            / f"{output_filename_prefix}_parameters.csv",
-            index=False,
-        )
-
-        print(f"\n\tTime elapsed: {(time.time() - time_start)/60:.2f} minutes.")
-
     def compute_hydropower_production_vectorized(
         self,
         accumulated_streamflow_per_polygon_filename: str = "ds_prevah_500_streamflow_accum_per_polygon_hourly.zarr",
-        output_filename_prefix: str = "ds_prevah_500_hydropower_production_ror_vectorized",
+        output_filename: str = "ds_prevah_500_hydropower_production_ror_vectorized.zarr",
         allowed_types: list[str] | None = None,
         timestep_hours: int = 1,
-        use_sparse: bool = False,
+        use_simplified_efficiency: bool = False,
     ) -> None:
         """Vectorized hydropower production using polygon->plant weight matrix and xr.dot.
 
@@ -865,11 +856,17 @@ class DataProcessingDask:
             Restrict to these plant types (e.g. ["L"]). If None, use all.
         timestep_hours : int
             Length of timestep (1 for hourly, 24 for daily input).
-        use_sparse : bool
-            Use sparse incidence matrix if True (for very large polygon x plant matrix).
+        use_simplified_efficiency : bool
+            Whether to use simplified efficiency calculation or default efficiency (0.8)
         """
         print("Vectorized hydropower production (start)")
         t0 = time.time()
+        if accumulated_streamflow_per_polygon_filename is None:
+            accumulated_streamflow_per_polygon_filename = (
+                self.accumulated_streamflow_per_polygon_filename
+            )
+        if output_filename is None:
+            output_filename = self.hydropower_production_filename
 
         # Load hydropower polygons metadata
         if self.df_hydropower_polygons is None:
@@ -899,26 +896,27 @@ class DataProcessingDask:
         # Vectorized compute (Steps 2-5)
         output_dir = self.path_data_hydro / "hydropower_generation"
         output_dir.mkdir(parents=True, exist_ok=True)
-        output_path = output_dir / f"{output_filename_prefix}.zarr"
-
-        ds_vec = compute_hydropower_production_vectorized(
-            self.ds_accumulated_streamflow_polygon,
-            hp_params_df,
-            variable="rgs",
-            timestep_hours=timestep_hours,
-            weights_sparse=use_sparse,
-            output_path=output_path,
-        )
+        output_path = output_dir / output_filename
+        var_name = list(self.ds_accumulated_streamflow_polygon.data_vars.keys())[0]
+        with ProgressBar(dt=10):
+            ds_vec = compute_hydropower_production_vectorized(
+                self.ds_accumulated_streamflow_polygon,
+                hp_params_df,
+                variable=var_name,
+                timestep_hours=timestep_hours,
+                use_simplified_efficiency=use_simplified_efficiency,
+                output_path=output_path,
+            )
 
         # Save parameter table for reference
         hp_params_df.to_csv(
-            output_dir / f"{output_filename_prefix}_parameters.csv",
+            output_dir / f"{output_filename.split('.')[0]}_parameters.csv",
             index=False,
         )
 
         # Basic reporting
         print(
-            f"Vectorized hydropower production saved: {output_path} | time elapsed: {(time.time() - t0)/60:.2f} min | plants: {ds_vec.dims.get('hydropower', 0)}"
+            f"Vectorized hydropower production saved: {output_path} | time elapsed: {(time.time() - t0)/60:.2f} min | plants: {ds_vec.sizes.get('hydropower', 0)}"
         )
 
     def compute_monthly_bias_correction_factors(
@@ -943,7 +941,7 @@ class DataProcessingDask:
         print("Computing monthly bias correction factors")
         time_start = time.time()
         self.df_reported_generation = pd.read_csv(
-            self.path_data
+            self.path_data_ror
             / "energy"
             / "ogd35_schweizerische_elektrizitaetsbilanz_monatswerte.csv"
         )
@@ -1014,50 +1012,89 @@ if __name__ == "__main__":
             "logging.distributed": "error",  # Less verbose logs
         }
     )
-    climate_model_chain = None
-    climate_scenario = None
 
-    # climate_model_chain = "CNRM-ALADIN63_CNRM-CERFACS-CNRM-CM5_r1i1p1"
-    # climate_scenario = "rcp85"
+    parser = argparse.ArgumentParser(
+        description="Run PREVAH -> hydropower processing. If climate_model_chain and climate_scenario are omitted, observational data are used."
+    )
+    parser.add_argument(
+        "--climate_model_chain",
+        "-c",
+        type=str,
+        default=None,
+        help="Climate model chain identifier (e.g. CNRM-ALADIN63_CNRM-CERFACS-CNRM-CM5_r1i1p1). Omit for observations.",
+    )
+    parser.add_argument(
+        "--climate_scenario",
+        "-s",
+        type=str,
+        default=None,
+        help="Climate scenario (e.g. rcp85). Omit for observations.",
+    )
+    parser.add_argument(
+        "--weighted_sum",
+        "-w",
+        action="store_true",
+        help="Use weighted sum for polygon-grid cell mapping.",
+    )
+
+    args = parser.parse_args()
+    climate_model_chain = args.climate_model_chain
+    climate_scenario = args.climate_scenario
+    weighted_sum = args.weighted_sum
+    prevah_grid_resolution = 500
 
     if climate_model_chain is None and climate_scenario is None:
         df_prevah_pts_in_polygons_filename = "df_prevah_obs_pts_in_polygons.csv"
+        accumulated_streamflow_per_polygon_filename = (
+            "ds_prevah_obs_streamflow_accum_per_polygon"
+        )
+        accumulated_streamflow_per_polygon_filename += (
+            "_weighted.zarr" if weighted_sum else ".zarr"
+        )
+        hydropower_production_filename = "ds_prevah_obs_hydropower_production_ror.zarr"
     else:
         df_prevah_pts_in_polygons_filename = "df_prevah_proj_pts_in_polygons.csv"
+        accumulated_streamflow_per_polygon_filename = f"ds_prevah_{climate_model_chain}_{climate_scenario}_streamflow_accum_per_polygon"
+        accumulated_streamflow_per_polygon_filename += (
+            "_weighted.zarr" if weighted_sum else ".zarr"
+        )
+        hydropower_production_filename = f"ds_prevah_{climate_model_chain}_{climate_scenario}_hydropower_production_ror.zarr"
 
     data_processing = DataProcessingDask(
-        "paths_projections.json", climate_model_chain, climate_scenario
+        "paths_projections.json",
+        climate_model_chain,
+        climate_scenario,
+        weighted_sum=weighted_sum,
     )
+    # if data_processing.weighted:
+    #     print("Using weighted sum for polygon-grid cell mapping.")
+    #     data_processing.extract_points_in_polygons_weighted(
+    #         prevah_grid_resolution=prevah_grid_resolution,
+    #         fraction_overlap=0.001,
+    #         max_distance_nearest=2000,
+    #         output_filename=df_prevah_pts_in_polygons_filename.removesuffix(".csv")
+    #         + "_weighted.csv",
+    #     )
+    # else:
+    #     print("Using uniform weights for polygon-grid cell mapping.")
+    #     data_processing.extract_points_in_polygons(
+    #         output_filename=df_prevah_pts_in_polygons_filename
+    #     )
 
-    data_processing.extract_points_in_polygons(output_filename=df_prevah_pts_in_polygons_filename)
-    # data_processing.compute_accumulated_streamflow_per_polygon()
-    # data_processing.get_catchment_area_per_hydropower()
-    # data_processing.compute_hydropower_production(
-    #     output_filename_prefix="ds_prevah_500_hydropower_production_ror"
+    # data_processing.compute_accumulated_streamflow_per_polygon(
+    #     output_filename=accumulated_streamflow_per_polygon_filename,
     # )
-    # hydropower_generation_dataset_filename = (
-    #     "ds_prevah_500_hydropower_production_ror.nc"
-    # )
-    # monthly_bias_correction_factors_filename = (
-    #     "ds_prevah_500_hydropower_production_ror_monthly_bias_correction_factors.nc"
-    # )
+    data_processing.compute_hydropower_production_vectorized(
+        accumulated_streamflow_per_polygon_filename=accumulated_streamflow_per_polygon_filename.removesuffix(
+            ".zarr"
+        )
+        + "_hourly.zarr",
+        output_filename=hydropower_production_filename,
+        allowed_types=["L"],
+        timestep_hours=1,
+        use_simplified_efficiency=True,
+    )
     # data_processing.compute_monthly_bias_correction_factors(
-    #     hydropower_generation_dataset_filename,
-    #     monthly_bias_correction_factors_filename,
-    # )
-
-    # --- Vectorized hydropower production pipeline (preferred) ---
-    # Requires precomputed polygon streamflow aggregated dataset (e.g., produced by mask aggregation)
-    # Example placeholder paths; update to actual locations in your environment.
-    # data_processing.compute_hydropower_production_vectorized(
-    #     streamflow_polygon_zarr=str(
-    #         data_processing.path_data_hydro / "streamflow_polygons.zarr"
-    #     ),
-    #     hydropower_params_output=str(
-    #         data_processing.path_data_hydro / "hydropower_params.parquet"
-    #     ),
-    #     hydropower_generation_output=str(
-    #         data_processing.path_data_hydro / "hydropower_generation_vectorized.zarr"
-    #     ),
-    #     use_sparse=False,
+    #     hydropower_generation_filename=hydropower_production_filename,
+    #     output_filename=hydropower_production_filename.removesuffix(".zarr") + "_monthly_bias_correction_factors.zarr"
     # )

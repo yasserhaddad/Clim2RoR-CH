@@ -28,3 +28,6 @@ pyproject.toml
 paths.json
 paths_projections.json
 .github/
+data/
+data/*py
+logs/*

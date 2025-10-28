@@ -1,9 +1,12 @@
 from typing import Any, List
 
+import numpy as np
+import xarray as xr
 import geopandas as gpd
 import pandas as pd
 from shapely.ops import nearest_points
-
+from shapely.geometry import box
+from typing import Optional
 
 def get_points_in_polygons(
     gdf_polygons: gpd.GeoDataFrame,
@@ -52,6 +55,219 @@ def get_points_in_polygons(
     )
 
     return gdf_concat
+
+def build_prevah_grid_points(
+    ds_prevah: xr.Dataset,
+    resolution: float,
+    crs: str = "EPSG:2056",
+) -> gpd.GeoDataFrame:
+    df_runoff = ds_prevah.isel(time=0)
+    new_x = (
+        np.round(df_runoff.x.values / resolution) * resolution
+    ).astype(df_runoff.x.dtype)
+    new_y = (
+        np.round(df_runoff.y.values / resolution) * resolution
+    ).astype(df_runoff.y.dtype)
+    df_runoff = df_runoff.assign_coords(x=new_x, y=new_y)
+    df_runoff = df_runoff.to_dataframe().reset_index()
+
+    # Build grid point GeoDataFrame (centers) and grid cell GeoDataFrame (polygons)
+    return gpd.GeoDataFrame(
+        df_runoff,
+        geometry=gpd.points_from_xy(df_runoff.x, df_runoff.y),
+        crs=crs,
+    )[["y", "x", "geometry"]]
+
+def build_prevah_grid_cells(
+    x_coords: List[float],
+    y_coords: List[float],
+    resolution: float,
+    crs: str = "EPSG:2056",
+) -> gpd.GeoDataFrame:
+    """
+    Build a GeoDataFrame of PREVAH rectangular grid cells from 1D coordinate arrays.
+
+    Parameters
+    ----------
+    x_coords : List[float]
+        1D sequence of x coordinates (cell centers).
+    y_coords : List[float]
+        1D sequence of y coordinates (cell centers).
+    resolution : float
+        Side length of each square grid cell (same units as coordinates, e.g. meters for EPSG:2056).
+    crs : str, optional
+        Coordinate reference system for the returned GeoDataFrame, by default "EPSG:2056".
+
+    Returns
+    -------
+    gpd.GeoDataFrame
+        GeoDataFrame with columns ['x', 'y', 'geometry'] where 'geometry' contains
+        shapely.box polygons representing square grid cells centered on (x, y).
+    """
+    half = resolution / 2.0
+    rows = [
+        {"x": float(x), "y": float(y), "geometry": box(x - half, y - half, x + half, y + half)}
+        for y in y_coords
+        for x in x_coords
+    ]
+    gdf = gpd.GeoDataFrame(rows, crs=crs)
+    return gdf
+
+
+def map_polygons_to_grid_by_intersection(
+    gdf_polygons: gpd.GeoDataFrame,
+    gdf_grid_cells: gpd.GeoDataFrame,
+    min_fraction: float = 0.0,
+) -> pd.DataFrame:
+    """
+    Compute intersection area between polygons and grid cells and return weights.
+
+    Parameters
+    ----------
+    gdf_polygons : geopandas.GeoDataFrame
+        GeoDataFrame containing polygons with an 'EZGNR' column and 'geometry'.
+    gdf_grid_cells : geopandas.GeoDataFrame
+        GeoDataFrame containing grid cell polygons with 'x', 'y' and 'geometry' columns
+        (grid cell centers stored in 'x' and 'y').
+    min_fraction : float, optional
+        Minimum fraction of the grid cell area that must be covered by the polygon
+        to keep the mapping (intersect_area / cell_area). Default is 0.0 (keep all).
+
+    Returns
+    -------
+    pandas.DataFrame
+        DataFrame with columns:
+        - x : float
+            x coordinate of the grid cell center
+        - y : float
+            y coordinate of the grid cell center
+        - EZGNR : int
+            Polygon identifier that intersects the cell
+        - cell_area : float
+            Area of the grid cell geometry (same units as input CRS)
+        - intersect_area : float
+            Area of the intersection between the cell and the polygon
+        - weight : float
+            Fraction of the cell area covered by the polygon (intersect_area / cell_area)
+    """
+    # quick candidate selection via spatial join
+    candidates = gpd.sjoin(
+        gdf_grid_cells,
+        gdf_polygons[["EZGNR", "geometry"]],
+        how="left",
+        predicate="intersects",
+    )
+    candidates = candidates.dropna(subset=["EZGNR"]).reset_index(drop=True)
+
+    if candidates.empty:
+        return pd.DataFrame(columns=["x", "y", "EZGNR", "cell_area", "intersect_area", "weight"])
+
+    # build map for faster geometry lookup
+    poly_map = {row.EZGNR: row.geometry for row in gdf_polygons.itertuples(index=False)}
+    results = []
+    for row in candidates.itertuples(index=False):
+        cell_geom = row.geometry
+        ezg = int(row.EZGNR)
+        poly_geom = poly_map.get(ezg)
+        if poly_geom is None:
+            continue
+        inter = cell_geom.intersection(poly_geom)
+        if inter.is_empty:
+            continue
+        cell_area = float(cell_geom.area)
+        inter_area = float(inter.area)
+        if cell_area <= 0:
+            continue
+        weight = inter_area / cell_area
+        if weight >= min_fraction:
+            results.append(
+                {
+                    "x": float(row.x),
+                    "y": float(row.y),
+                    "EZGNR": ezg,
+                    "cell_area": cell_area,
+                    "intersect_area": inter_area,
+                    "weight": weight,
+                }
+            )
+
+    return pd.DataFrame(results)
+
+
+def fill_missing_polygons_by_nearest(
+    gdf_polygons: gpd.GeoDataFrame,
+    gdf_grid_points: gpd.GeoDataFrame,
+    missing_ezg_list: List[int],
+    max_distance: Optional[float] = None,
+) -> pd.DataFrame:
+    """
+    Assign the nearest PREVAH grid point to polygons that had no overlapping grid cell.
+
+    Parameters
+    ----------
+    gdf_polygons : geopandas.GeoDataFrame
+        GeoDataFrame of polygons containing at least 'EZGNR' and 'geometry' columns.
+    gdf_grid_points : geopandas.GeoDataFrame
+        GeoDataFrame of PREVAH grid points (centers) containing 'x', 'y' and 'geometry'.
+    missing_ezg_list : list of int
+        List of EZGNR identifiers for polygons that lacked overlapping grid cells.
+    max_distance : float or None, optional
+        Maximum search distance (in the units of the CRS, e.g. meters for EPSG:2056).
+        If None the function computes a default value equal to half the diagonal of a grid cell
+        inferred from the two smallest distinct x and y steps. Default is None.
+
+    Returns
+    -------
+    pandas.DataFrame
+        DataFrame with one row per successfully assigned polygon containing columns:
+        - EZGNR (int): polygon identifier
+        - x (float): x coordinate of assigned grid point (cell center)
+        - y (float): y coordinate of assigned grid point (cell center)
+        - method (str): assignment method, e.g. "nearest"
+        - distance_m (float): distance from polygon representative point to assigned grid point
+    """
+    assigned = []
+    # spatial index for grid points
+    pts_sindex = gdf_grid_points.sindex
+    # compute default max_distance if not provided
+    if max_distance is None:
+        xs = sorted(gdf_grid_points.x.unique())
+        ys = sorted(gdf_grid_points.y.unique())
+        if len(xs) > 1 and len(ys) > 1:
+            dx = abs(xs[1] - xs[0])
+            dy = abs(ys[1] - ys[0])
+            max_distance = 0.5 * (dx**2 + dy**2) ** 0.5  # half diagonal
+        else:
+            max_distance = 1000.0
+    print(f"Using max_distance = {max_distance} for nearest point search.")
+    # Map polygons by EZGNR for speed
+    poly_map = {row.EZGNR: row.geometry for row in gdf_polygons.itertuples(index=False)}
+    for ezg in missing_ezg_list:
+        poly = poly_map.get(ezg)
+        if poly is None:
+            continue
+        # choose interior point to avoid exterior centroid for thin shapes
+        pt = poly.representative_point()
+        # find nearest candidate index (1)
+        try:
+            nearest_idx = list(pts_sindex.nearest(pt.bounds, 1))[0]
+        except Exception:
+            continue
+        nearest_row = gdf_grid_points.iloc[nearest_idx]
+        dist = float(pt.distance(nearest_row.geometry))
+        if dist <= max_distance:
+            assigned.append(
+                {
+                    "EZGNR": int(ezg),
+                    "x": float(nearest_row.x),
+                    "y": float(nearest_row.y),
+                    "method": "nearest",
+                    "distance_m": float(dist),
+                }
+            )
+    print(f"Assigned {len(assigned)} polygons by nearest point.")
+    print(f"Average distance: {np.mean([a['distance_m'] for a in assigned])} m")
+    return pd.DataFrame(assigned)
 
 def get_df_upstream_polygons(
     df_polygon_connectivity: pd.DataFrame,
@@ -139,7 +355,6 @@ def find_upstream_polygons_recursive(
                 )
 
     return list(connected_polygons)
-
 
 def get_nearest_values(
     row, other_gdf, point_column="geometry", value_column="geometry"
