@@ -1,7 +1,6 @@
 import json
 import os
 
-import shutil
 import time
 from pathlib import Path
 
@@ -12,12 +11,7 @@ import xarray as xr
 from itertools import repeat
 from multiprocessing import Pool
 
-from src.extract_runoff_prevah import (
-    batch_extraction_prevah,
-)
 from src.utils_polygons import (
-    find_upstream_polygons_recursive,
-    flatten_list,
     get_points_in_polygons,
     build_prevah_grid_points,
     build_prevah_grid_cells,
@@ -26,12 +20,7 @@ from src.utils_polygons import (
 )
 
 from src.utils_streamflow_hydropower import (
-    GRAVITY,
-    WATER_DENSITY,
-    compute_ds_hydropower_generation_from_streamflow,
-    compute_simplified_efficiency_term,
     aggregate_streamflow_with_mask,
-    concat_list_ds_and_save,
     convert_mm_d_to_cubic_m_s,
     build_hydropower_parameter_table,
     compute_hydropower_production_vectorized,
@@ -184,27 +173,6 @@ class DataProcessingDask:
         )
         self.accumulated_streamflow_per_polygon_filename += (
             "_weighted.zarr" if weighted_sum else ".zarr"
-        )
-
-    def convert_bin_to_netcdf_runoff_prevah(self) -> None:
-        """Extracts runoff values from gz binary PREVAH data and stores them in
-        netcdf files. Each file contains one year of data.
-        """
-        path_hydro_tar = self.path_data_prevah / "compressed"
-        netcdf_output_dir = self.path_data_prevah / "netcdf"
-        if netcdf_output_dir.exists():
-            shutil.rmtree(netcdf_output_dir)
-        netcdf_output_dir.mkdir(exist_ok=True)
-
-        product = "RGS"
-        batch_extraction_prevah(
-            path_hydro_tar,
-            netcdf_output_dir,
-            product,
-            prefix_filename_tgz="wsl2zero_",
-            prefix_filename_gz="Mob500",
-            convert_coords=True,
-            num_workers=8,
         )
 
     def extract_points_in_polygons(
