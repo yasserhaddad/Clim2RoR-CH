@@ -68,8 +68,8 @@ class DataProcessingDask:
     def __init__(
         self,
         paths_file: str,
-        climate_model_chain: str,
-        climate_scenario: str,
+        climate_model_chain: str = None,
+        climate_scenario: str = None,
         weighted_sum: bool = True,
     ):
         print("Loading data")
@@ -167,9 +167,6 @@ class DataProcessingDask:
             )
             self.accumulated_streamflow_per_polygon_filename = (
                 "ds_prevah_obs_streamflow_accum_per_polygon"
-            )
-            self.accumulated_streamflow_per_polygon_filename += (
-                "_weighted.zarr" if weighted_sum else ".zarr"
             )
             self.hydropower_production_filename = (
                 "ds_prevah_obs_hydropower_production_ror.zarr"
