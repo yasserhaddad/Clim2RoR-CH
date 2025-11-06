@@ -1,32 +1,34 @@
+import argparse
 import json
 import os
-
 import time
+from itertools import repeat
+from multiprocessing import Pool
 from pathlib import Path
 
+import dask
+import geopandas as gpd
 import numpy as np
 import pandas as pd
 import xarray as xr
-
-from itertools import repeat
-from multiprocessing import Pool
+from dask.diagnostics import ProgressBar
 
 from src.utils_polygons import (
-    get_points_in_polygons,
-    build_prevah_grid_points,
     build_prevah_grid_cells,
-    map_polygons_to_grid_by_intersection,
+    build_prevah_grid_points,
     fill_missing_polygons_by_nearest,
+    get_points_in_polygons,
+    map_polygons_to_grid_by_intersection,
 )
-
 from src.utils_streamflow_hydropower import (
     aggregate_streamflow_with_mask,
-    convert_mm_d_to_cubic_m_s,
     build_hydropower_parameter_table,
     compute_hydropower_production_vectorized,
+    convert_mm_d_to_cubic_m_s,
     mode_of,
 )
 from src.var_attributes import ACCUM_HYDRO_ZARR_ENCODING
+from src.data_analysis import compute_monthly_generation_from_ds
 
 # Set environment variables after imports so import block remains contiguous
 os.environ["OMP_NUM_THREADS"] = "1"
@@ -34,11 +36,6 @@ os.environ["MKL_NUM_THREADS"] = "1"
 os.environ["OPENBLAS_NUM_THREADS"] = "1"
 os.environ["NUMEXPR_NUM_THREADS"] = "1"
 os.environ["USE_PYGEOS"] = "1"
-
-import dask
-from dask.diagnostics import ProgressBar
-import geopandas as gpd
-import argparse
 
 DEFAULT_EFFICIENCY = 0.8
 
@@ -63,7 +60,7 @@ class DataProcessingDask:
     ):
         print("Loading data")
         paths = json.load(open(paths_file))
-        self.path_data_ror = Path(paths["path_data_ror"])
+        self.path_data = Path(paths["path_data"])
         self.path_data_projections = Path(paths["path_data_projections"])
         self.climate_model_chain = climate_model_chain
         self.climate_scenario = climate_scenario
@@ -76,10 +73,10 @@ class DataProcessingDask:
                 / "prevah"
             )
         else:
-            self.path_data_prevah = self.path_data_ror / "prevah_obs"
+            self.path_data_prevah = self.path_data / "prevah_obs"
 
-        self.path_data_hydro = self.path_data_ror / "hydropower"
-        self.path_data_polygons = self.path_data_ror / "polygons"
+        self.path_data_hydro = self.path_data / "hydropower"
+        self.path_data_polygons = self.path_data / "polygons"
 
         self.gdf_polygons = gpd.read_file(
             self.path_data_polygons / "EZG_Gewaesser.gpkg"
@@ -151,9 +148,7 @@ class DataProcessingDask:
         self.grid_pt_in_polygon = None
 
         if climate_model_chain is None and climate_scenario is None:
-            self.df_prevah_pts_in_polygons_filename = (
-                "df_prevah_obs_pts_in_polygons"
-            )
+            self.df_prevah_pts_in_polygons_filename = "df_prevah_obs_pts_in_polygons"
             self.accumulated_streamflow_per_polygon_filename = (
                 "ds_prevah_obs_streamflow_accum_per_polygon"
             )
@@ -161,9 +156,7 @@ class DataProcessingDask:
                 "ds_prevah_obs_hydropower_production_ror.zarr"
             )
         else:
-            self.df_prevah_pts_in_polygons_filename = (
-                "df_prevah_proj_pts_in_polygons"
-            )
+            self.df_prevah_pts_in_polygons_filename = "df_prevah_proj_pts_in_polygons"
             self.accumulated_streamflow_per_polygon_filename = f"ds_prevah_{climate_model_chain}_{climate_scenario}_streamflow_accum_per_polygon"
 
             self.hydropower_production_filename = f"ds_prevah_{climate_model_chain}_{climate_scenario}_hydropower_production_ror.zarr"
@@ -624,13 +617,18 @@ class DataProcessingDask:
             encoding["time"] = {
                 "units": f"seconds since {np.datetime_as_string(ds_accum_hourly.time[0].values)}"
             }
-            output_filepath = self.path_data_prevah / f"{output_filename.remove_suffix('.zarr')}_hourly.zarr"
+            output_filepath = (
+                self.path_data_prevah
+                / f"{output_filename.remove_suffix('.zarr')}_hourly.zarr"
+            )
             ds_accum_hourly.chunk(chunks_accum).to_zarr(
                 output_filepath, mode="w", encoding=encoding
             )
             self.ds_accumulated_streamflow_polygon = ds_accum_hourly
 
-            print(f"\tSaved accumulated streamflow per polygon to Zarr: {output_filepath}")
+            print(
+                f"\tSaved accumulated streamflow per polygon to Zarr: {output_filepath}"
+            )
 
         print(
             f"\tTotal time for accumulated streamflow: {(time.time() - time_start)/60:.2f} minutes."
@@ -886,7 +884,7 @@ class DataProcessingDask:
 
     def compute_monthly_bias_correction_factors(
         self,
-        hydropower_generation_filename: str,
+        method: str,
         output_filename: str = "ds_monthly_bias_correction_factors.nc",
     ) -> None:
         """Computes the monthly bias correction factors from monthly historical reported
@@ -896,60 +894,75 @@ class DataProcessingDask:
 
         Parameters
         ----------
-        hydropower_generation_filename : str
-            Name of file containing hydropower generation xarray Dataset
+        method : str
+            Method to compute the bias correction factors. Can be either
+            "per_timestep" or "monthly_mean".
         output_filename : str, optional
             Name of output file that contains the monthly bias correction factors,
             replicated for each timestep in the hydropower generation xarray Dataset,
             by default "ds_monthly_bias_correction_factors.nc"
         """
+        if method not in ["per_timestep", "monthly_mean"]:
+            raise ValueError("method must be either 'per_timestep' or 'monthly_mean'")
         print("Computing monthly bias correction factors")
         time_start = time.time()
         self.df_reported_generation = pd.read_csv(
-            self.path_data_ror
+            self.path_data
             / "energy"
             / "ogd35_schweizerische_elektrizitaetsbilanz_monatswerte.csv"
         )
+        start_year = self.df_reported_generation.Jahr.min()
+        end_year = self.df_reported_generation[
+            self.df_reported_generation.Monat == 12
+        ].Jahr.max()
 
-        ds_hydropower_generation = xr.open_dataset(
+        ds_hydropower_generation = xr.open_zarr(
             self.path_data_hydro
             / "hydropower_generation"
-            / hydropower_generation_filename
-        ).sel(time=slice("2000", "2022"))
+            / self.hydropower_production_filename,
+            chunks="auto",
+        )
         df_reported_generation_ror = self.df_reported_generation[
-            self.df_reported_generation.Jahr < 2023
+            self.df_reported_generation.Jahr <= end_year
         ][["Jahr", "Monat", "Erzeugung_laufwerk_GWh"]]
         df_reported_generation_ror["Erzeugung_laufwerk_GWh"] *= 1e-3  # to TWh
-
-        list_ds = []
-        hp_in_ds = ds_hydropower_generation.hydropower.to_numpy()
-        for i in np.unique(ds_hydropower_generation.time.dt.year):
-            wasta = self.gdf_hydropower_locations[
-                (self.gdf_hydropower_locations["BeginningOfOperation"] <= i)
-                & (self.gdf_hydropower_locations["WASTANumber"].isin(hp_in_ds))
-            ]["WASTANumber"].tolist()
-            list_ds.append(
-                ds_hydropower_generation.sel(hydropower=wasta, time=str(i))
-                .resample(time="M")
-                .sum(["hydropower", "time"])
-            )
-        ds_hydropower_generation_per_month = xr.concat(list_ds, dim="time")
+        df_reported_generation_ror = df_reported_generation_ror.rename(
+            columns={"Erzeugung_laufwerk_GWh": "Reported Generation"}
+        )
+        ds_hydropower_generation_per_month = compute_monthly_generation_from_ds(
+            ds_hydropower_generation, self.gdf_hydropower_locations,
+            resample_rule="ME",
+            start_year=start_year,
+            end_year=end_year,
+        )
 
         df_reported_generation_ror["Estimated Generation"] = (
             ds_hydropower_generation_per_month.sel(
-                time=slice("2000", None)
+                time=slice(str(start_year), None)
             ).gen.to_numpy()
         )
-        df_reported_generation_ror["Relative Bias"] = (
-            df_reported_generation_ror["Estimated Generation"]
-            / df_reported_generation_ror["Reported Generation"]
-        )
-        df_reported_generation_ror_monthly_mean = df_reported_generation_ror.groupby(
-            "Monat"
-        ).mean()
-        monthly_values = (
-            1 / df_reported_generation_ror_monthly_mean["Relative Bias"]
-        ).to_numpy()
+
+        if method == "per_timestep":
+            df_reported_generation_ror["Relative Bias"] = (
+                df_reported_generation_ror["Estimated Generation"]
+                / df_reported_generation_ror["Reported Generation"]
+            )
+            df_reported_generation_ror_monthly_mean = (
+                df_reported_generation_ror.groupby("Monat").mean()
+            )
+            monthly_values = (
+                1 / df_reported_generation_ror_monthly_mean["Relative Bias"]
+            ).to_numpy()
+        else:  # method == "monthly_mean"
+            df_monthly_means = df_reported_generation_ror.groupby(
+                df_reported_generation_ror["Monat"]
+            ).mean()
+            df_monthly_means["Relative Bias"] = (
+                df_monthly_means["Estimated Generation"]
+                / df_monthly_means["Reported Generation"]
+            )
+            monthly_values = (1 / df_monthly_means["Relative Bias"]).to_numpy()
+
         indices_months = ds_hydropower_generation.groupby("time.month").groups
         monthly_bias_correction_factors = np.empty(len(ds_hydropower_generation.time))
         for i, month in enumerate(indices_months):
@@ -960,8 +973,18 @@ class DataProcessingDask:
             dims=["time"],
             coords={"time": (["time"], ds_hydropower_generation.time.values)},
         )
-        ds_monthly_bias_correction_factors.rename("bias_correction_factor").to_netcdf(
-            self.path_data_hydro / "hydropower_generation" / output_filename
+        chunks = {"time": ds_hydropower_generation.chunks["time"][0]}
+        ds_monthly_bias_correction_factors.rename("bias_correction_factor").chunk(
+            chunks
+        ).to_zarr(
+            self.path_data_hydro / "hydropower_generation" / output_filename,
+            encoding={
+                "bias_correction_factor": {
+                    "compressor": ACCUM_HYDRO_ZARR_ENCODING["compressor"],
+                    "chunks": tuple(chunks.values()),
+                }
+            },
+            mode="w",
         )
         print(f"\tTime elapsed: {(time.time() - time_start)/60:.2f} minutes.")
 
@@ -1049,17 +1072,18 @@ if __name__ == "__main__":
     # data_processing.compute_accumulated_streamflow_per_polygon(
     #     output_filename=accumulated_streamflow_per_polygon_filename,
     # )
-    data_processing.compute_hydropower_production_vectorized(
-        accumulated_streamflow_per_polygon_filename=accumulated_streamflow_per_polygon_filename.removesuffix(
-            ".zarr"
-        )
-        + "_hourly.zarr",
-        output_filename=hydropower_production_filename,
-        allowed_types=["L"],
-        timestep_hours=1,
-        use_simplified_efficiency=True,
-    )
-    # data_processing.compute_monthly_bias_correction_factors(
-    #     hydropower_generation_filename=hydropower_production_filename,
-    #     output_filename=hydropower_production_filename.removesuffix(".zarr") + "_monthly_bias_correction_factors.zarr"
+    # data_processing.compute_hydropower_production_vectorized(
+    #     accumulated_streamflow_per_polygon_filename=accumulated_streamflow_per_polygon_filename.removesuffix(
+    #         ".zarr"
+    #     )
+    #     + "_hourly.zarr",
+    #     output_filename=hydropower_production_filename,
+    #     allowed_types=["L"],
+    #     timestep_hours=1,
+    #     use_simplified_efficiency=True,
     # )
+    data_processing.compute_monthly_bias_correction_factors(
+        method="per_timestep" if climate_model_chain is None else "monthly_mean",
+        output_filename=hydropower_production_filename.removesuffix(".zarr")
+        + "_monthly_bias_correction_factors.zarr",
+    )

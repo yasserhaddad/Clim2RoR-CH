@@ -31,3 +31,4 @@ paths_projections.json
 data/
 data/*py
 logs/*
+logs
